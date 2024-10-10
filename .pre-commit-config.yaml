@@ -1,0 +1,47 @@
+fail_fast: false
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v3.3.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Format files with rustfmt.
+        entry: bash -c 'cargo fmt -- --check'
+        language: rust
+        files: \.rs$
+      - id: taplo-fmt
+        name: format Cargo.toml
+        description: cargo install taplo-cli
+        entry: taplo fmt --check --option reorder_keys=true --option indent_string='    '
+        language: rust
+        files: \.toml$
+      - id: typos
+        name: typos check
+        description: check typo, cargo install typos-cli
+        entry: typos
+        language: rust
+      - id: cargo-check
+        name: cargo check
+        description: Check the package for errors.
+        entry: bash -c 'cargo check --all'
+        language: rust
+        files: \.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint rust sources
+        entry: bash -c 'cargo clippy --all-targets --all-features --tests --benches -- -D warnings'
+        language: rust
+        files: \.rs$
+        pass_filenames: false
+      - id: cargo-test
+        name: cargo test
+        description: run stateless unittest
+        entry: cargo test --all -- --nocapture
+        language: rust
+        files: \.rs$
+        pass_filenames: false
