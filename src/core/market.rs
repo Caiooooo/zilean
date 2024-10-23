@@ -1,6 +1,5 @@
-use std::default;
-
-use serde::{Deserialize, Serialize};
+use clickhouse::Row;
+use sonic_rs::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum Exchange {
@@ -9,18 +8,6 @@ pub enum Exchange {
     CoinbaseSpot,
     OkxSpot,
     KrakenSpot,
-}
-
-impl Exchange {
-    pub fn from_str(s: &str) -> Option<Exchange> {
-        match s {
-            "BinanceSpot" => Some(Exchange::BinanceSpot),
-            "CoinbaseSpot" => Some(Exchange::CoinbaseSpot),
-            "OkxSpot" => Some(Exchange::OkxSpot),
-            "KrakenSpot" => Some(Exchange::KrakenSpot),
-            _ => None,
-        }
-    }
 }
 
 // version1.0 only support limit order
@@ -45,7 +32,7 @@ pub enum OrderSide {
     Sell,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum OrderState {
     #[default]
     Open,
@@ -54,7 +41,7 @@ pub enum OrderState {
     Filled,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Balance {
     total: f64,
     available: f64,
@@ -62,6 +49,10 @@ pub struct Balance {
 }
 
 impl Balance {
+    pub fn get_available(&self) -> f64 {
+        self.available
+    }
+
     pub fn add_freezed(&mut self, value: f64) {
         self.freezed += value;
         self.available -= value;
@@ -73,7 +64,7 @@ impl Balance {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct FeeRate {
     maker_fee: f64,
     taker_fee: f64,
@@ -87,14 +78,15 @@ pub enum PositionSide {
     Short,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct Account {
     pub backtest_id: String,
     pub balance: Balance,
     pub position: Position,
 }
 
-#[derive(Debug, Default)]
+#[allow(unused)]
+#[derive(Debug, Default, Serialize)]
 pub struct Position {
     exchange: Exchange,
     symbol: String,
@@ -131,38 +123,38 @@ pub struct Order {
 impl Order {
     pub fn execute(&mut self, depth: &Depth) -> (f64, f64) {
         let mut avg_price = 0.0;
-        let mut executed_amount= 0.0;
+        let mut executed_amount = 0.0;
         let mut executed_value = 0.0;
         let mut rest_amount = self.amount - self.filed_amount;
         let mut pos_coefficient = 1.0;
         match self.side {
             OrderSide::Buy => {
                 for ask in depth.asks.iter() {
-                    if ask.price > self.price || rest_amount <= 0.0{
+                    if ask.0 > self.price || rest_amount <= 0.0 {
                         break;
                     }
-                    let amount_to_execute = rest_amount.min(ask.amount);
+                    let amount_to_execute = rest_amount.min(ask.1);
                     executed_amount += amount_to_execute;
-                    executed_value += amount_to_execute * ask.price;
+                    executed_value += amount_to_execute * ask.0;
                     avg_price = executed_value / executed_amount;
                     rest_amount -= amount_to_execute;
                 }
             }
             OrderSide::Sell => {
                 for bid in depth.bids.iter() {
-                    if bid.price < self.price || rest_amount <= 0.0{
+                    if bid.0 < self.price || rest_amount <= 0.0 {
                         break;
                     }
-                    let amount_to_execute = rest_amount.min(bid.amount);
+                    let amount_to_execute = rest_amount.min(bid.1);
                     executed_amount += amount_to_execute;
-                    executed_value += amount_to_execute * bid.price;
+                    executed_value += amount_to_execute * bid.0;
                     avg_price = executed_value / executed_amount;
                     rest_amount -= amount_to_execute;
                 }
                 pos_coefficient = -1.0;
             }
         }
-        
+
         self.filed_amount = executed_amount;
         self.avg_price = avg_price;
 
@@ -171,23 +163,46 @@ impl Order {
         } else if self.filed_amount > 0.0 {
             self.state = OrderState::PartiallyFilled;
         }
-            
+
         (avg_price, executed_amount * pos_coefficient)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Level {
     price: f64,
     amount: f64,
 }
 
-#[derive(Default)]
+#[derive(Default, Deserialize, Serialize, Row, Debug)]
 pub struct Depth {
+    #[serde(deserialize_with = "deserialize_exchange")]
+    pub exchange: Exchange,
     pub symbol: String,
-    pub bids: Vec<Level>,
-    pub asks: Vec<Level>,
+    pub bids: Vec<(f64, f64)>,
+    pub asks: Vec<(f64, f64)>,
+    #[serde(rename = "exch_timestamp")]
     pub timestamp: i64,
+    pub local_timestamp: i64,
+}
+
+fn deserialize_exchange<'de, D>(deserializer: D) -> Result<Exchange, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    match s.as_str() {
+        "binance" => Ok(Exchange::BinanceSpot),
+        "coinbase" => Ok(Exchange::CoinbaseSpot),
+        "kraken" => Ok(Exchange::KrakenSpot),
+        "okx" => Ok(Exchange::OkxSpot),
+        "BinanceSpot" => Ok(Exchange::BinanceSpot),
+        "CoinbaseSpot" => Ok(Exchange::CoinbaseSpot),
+        "KrakenSpot" => Ok(Exchange::KrakenSpot),
+        "OkxSpot" => Ok(Exchange::OkxSpot),
+        // 更多匹配
+        _ => Err(serde::de::Error::custom(format!("Unknown exchange: {}", s))),
+    }
 }
 
 #[derive(Default)]
