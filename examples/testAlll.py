@@ -38,7 +38,7 @@ def init_backtest(socket, backtest_message):
     data = json.loads(reply.decode('utf-8'))
     
     if data.get('status') == 'ok':
-        return data.get('backtest_id')
+        return data.get('message')
     else:
         raise Exception("Failed to launch backtest: {}".format(data.get('message')))
 
@@ -96,7 +96,7 @@ def cancel_order(socket, cid):
     发送下单请求。
 
     参数:
-        cnt (int): 用于撤单的ID，用于唯一订单 ID。
+        cnt (int): 用于撤单的ID, 用于唯一订单 ID。
     """
     socket.send('CANCEL_ORDER'.encode('utf-8') + cid.encode('utf-8'))
     reply = socket.recv()
@@ -140,12 +140,16 @@ start_time = time.time()
 while cnt < 1000000:
     # 获取下一个时间点的 orderbook 数据
     try:
-        orderbook = get_data(socket_bt, 'TICK')
+        tick_data = get_data(socket_bt, 'TICK')
     except:
         for i in range(cnt):
             cancel_order(socket_bt, cnt)
     
-    message = json.loads(orderbook.get('message', {}).encode('utf-8'))
+    message = json.loads(tick_data.get('message', {}).encode('utf-8'))
+    depth = message.get('depth', 0)
+    acc_info = message.get('account', {})
+
+    print(f"Received tick data: {acc_info}")
     asks = message.get('asks', [])
     bids = message.get('bids', [])
 
@@ -161,10 +165,6 @@ while cnt < 1000000:
         # 测试下单逻辑：以最高卖价卖出
         order_response = post_order(socket_bt, "BinanceSpot", cnt, "BTC_USDT", best_bid+0.1, 1.0, side="Sell")
         print(f"Order Response: {order_response}")
-    
-        # 获取账户信息
-        acc_info = get_data(socket_bt, 'GET_ACCOUNT_INFO')
-        print(acc_info.get('message'))
 
         # cancel_order(bt_socket, cnt)
         # 检查账户信息是否正确

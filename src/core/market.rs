@@ -25,7 +25,7 @@ pub enum TimeInForce {
     Ioc,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum OrderSide {
     #[default]
     Buy,
@@ -62,6 +62,11 @@ impl Balance {
         self.freezed -= value;
         self.available += value;
     }
+
+    pub fn fill_freezed(&mut self, value: f64) {
+        self.total -= value;
+        self.freezed -= value;
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -78,29 +83,50 @@ pub enum PositionSide {
     Short,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct Account {
     pub backtest_id: String,
     pub balance: Balance,
     pub position: Position,
 }
 
-#[allow(unused)]
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct Position {
-    exchange: Exchange,
-    symbol: String,
+    pub exchange: Exchange,
+    pub symbol: String,
     // side: PositionSide,
-    amount: f64,
-    entry_price: f64,
+    pub amount_total: f64,
+    pub amount_available: f64,
+    pub amount_freezed: f64,
+    pub entry_price: f64,
     // entry_time: i64,
 }
 
 impl Position {
     pub fn update_pos(&mut self, price: f64, amount: f64) {
-        let old_value = self.amount * self.entry_price;
-        self.amount += amount;
-        self.entry_price = (old_value + amount * price) / self.amount;
+        let old_value = self.amount_total * self.entry_price;
+        self.fill_freezed(amount);
+        self.entry_price = (old_value + amount * price) / self.amount_total;
+    }
+
+    pub fn add_freezed(&mut self, value: f64) {
+        self.amount_freezed += value;
+        self.amount_available -= value;
+    }
+
+    pub fn sub_freezed(&mut self, value: f64) {
+        self.amount_freezed -= value;
+        self.amount_available += value;
+    }
+
+    // buy order fill, value > 0
+    pub fn fill_freezed(&mut self, value: f64) {
+        self.amount_total += value;
+        if value > 0.0 {
+            self.amount_available += value;
+        } else {
+            self.amount_freezed += value;
+        }
     }
 }
 
@@ -111,7 +137,7 @@ pub struct Order {
     pub symbol: String,
     pub price: f64,
     pub amount: f64,
-    pub filed_amount: f64,
+    pub filled_amount: f64,
     pub avg_price: f64,
     pub side: OrderSide,
     pub state: OrderState,
@@ -125,7 +151,7 @@ impl Order {
         let mut avg_price = 0.0;
         let mut executed_amount = 0.0;
         let mut executed_value = 0.0;
-        let mut rest_amount = self.amount - self.filed_amount;
+        let mut rest_amount = self.amount - self.filled_amount;
         let mut pos_coefficient = 1.0;
         match self.side {
             OrderSide::Buy => {
@@ -155,12 +181,12 @@ impl Order {
             }
         }
 
-        self.filed_amount = executed_amount;
+        self.filled_amount = executed_amount;
         self.avg_price = avg_price;
 
-        if self.filed_amount == self.amount {
+        if self.filled_amount == self.amount {
             self.state = OrderState::Filled;
-        } else if self.filed_amount > 0.0 {
+        } else if self.filled_amount > 0.0 {
             self.state = OrderState::PartiallyFilled;
         }
 

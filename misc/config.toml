@@ -1,6 +1,11 @@
+start_url = "ipc:///tmp/zilean_backtest.ipc"
+tick_url = "ipc:///tmp/zilean_backtest/"
+debug = false
+
 [database]
 host = "http://localhost"
 port = 8123
 database = "orderbook"
 username = "default"
-password = "RyQplVJetI2M"
+password = ""
+

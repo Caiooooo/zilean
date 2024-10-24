@@ -1,0 +1,16 @@
+[Unit]
+Description=Zilean Backtest Engine
+StartLimitIntervalSec=300
+StartLimitBurst=60
+
+[Service]
+ExecStart=/home/xxy/bin/zilean
+WorkingDirectory=/home/xxy/bin
+Environment=RUST_BACKTRACE=1
+UMask=000
+
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

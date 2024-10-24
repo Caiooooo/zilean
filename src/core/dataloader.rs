@@ -11,7 +11,7 @@ pub enum DataSource {
     Database,
     FilePath(String),
 }
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseAccount {
     pub host: String,
     pub port: u16,
@@ -37,7 +37,7 @@ impl DataLoader {
             _ => DataSource::Database,
         };
         let database = match source {
-            DataSource::Database => Some(config::dbConfig::new().database),
+            DataSource::Database => Some(config::ZConfig::parse("config.toml").database),
             _ => None,
         };
         DataLoader {
@@ -63,17 +63,25 @@ impl DataLoader {
             .with_password(dbconf.password)
             .with_database(dbconf.database);
 
+        let exchange_list: Vec<String> = self.config.exchanges.iter().map(|ex| match ex {
+            Exchange::BinanceSpot => "binance".to_string(),
+            Exchange::CoinbaseSpot => "coinbase".to_string(),
+            Exchange::OkxSpot => "okx".to_string(),
+            Exchange::KrakenSpot => "kraken".to_string(),
+        }).collect();
+
         let ret = 
             // TODO 支持期货查询
             client
                 .query(
-                    "SELECT ?fields FROM ? WHERE exch_timestamp >= ? AND exch_timestamp < ? LIMIT ? OFFSET ?",
+                    "SELECT ?fields FROM ? WHERE exchange IN (?) AND exch_timestamp >= ? AND exch_timestamp < ? ORDER BY local_timestamp LIMIT ? OFFSET ?",
                 )
                 .bind(Identifier(
                     format!("{}_spot", &self.config.symbol.split("_").next().unwrap())
                         .to_lowercase()
                         .as_str(),
                 ))
+                .bind(exchange_list)
                 .bind(self.config.start_time)
                 .bind(self.config.end_time)
                 .bind(self.limit)

@@ -1,3 +1,4 @@
 /target
 Cargo.lock
 /misc/*
+/config.toml

@@ -81,17 +81,18 @@ impl OrderList {
     pub fn execute_orders(&mut self, depth: &Depth) -> Vec<FilledStack> {
         let mut filled = vec![];
         self.inner.retain_mut(|order| {
-            if depth.timestamp > order.timestamp || order.exchange != depth.exchange {
+            if depth.timestamp < order.timestamp || order.exchange != depth.exchange {
                 return true; // keep this order
             }
-
             let (filled_price, filled_amount) = order.execute(depth);
-            filled.push(FilledStack {
-                exchange: order.exchange,
-                symbol: order.symbol.clone(),
-                filled_price,
-                filled_amount,
-            });
+            if filled_price != 0.0 {
+                filled.push(FilledStack {
+                    exchange: order.exchange,
+                    symbol: order.symbol.clone(),
+                    filled_price,
+                    filled_amount,
+                });
+            }
 
             order.state != OrderState::Filled // keep this order if not filled
         });
@@ -106,6 +107,12 @@ pub struct FilledStack {
     pub symbol: String,
     pub filled_price: f64,
     pub filled_amount: f64,
+}
+
+#[derive(Serialize, Default)]
+pub struct TickResponse {
+    pub depth: Depth,
+    pub account: Account,
 }
 
 // v1, do not support hedge backtest
@@ -135,12 +142,16 @@ impl ZileanV1 {
         }
     }
 
-    pub async fn launch(&mut self, backtest_id: String) -> Result<(), std::io::Error> {
+    pub async fn launch(
+        &mut self,
+        backtest_id: String,
+        tick_url: &str,
+    ) -> Result<(), std::io::Error> {
         self.prepare_data().await?;
         self.account.backtest_id = backtest_id;
         self.account.balance = self.config.balance.clone();
         self.state = BacktestState::Running;
-        self.start_listening().await;
+        self.start_listening(tick_url).await;
         Ok(())
     }
 
@@ -155,10 +166,8 @@ impl ZileanV1 {
     }
 
     pub async fn on_tick(&mut self) -> BacktestResponse {
-        let responder = BacktestResponse::new(self.account.backtest_id.clone());
-
         if self.state != BacktestState::Running {
-            return responder.bad_request("backtest is not running".to_string());
+            return BacktestResponse::bad_request("Backtest is not running".to_string());
         }
 
         if self.data_cache.is_empty() {
@@ -169,38 +178,40 @@ impl ZileanV1 {
             // if no more data, return an end status
             if self.data_cache.is_empty() {
                 self.state = BacktestState::Finished;
-                return responder.bad_request("no more data, backtestfinished".to_string());
+                return BacktestResponse::bad_request("No more data, backtestfinished".to_string());
             }
         }
         // println!("data_cache len: {}", self.data_cache.len());
         let depth = self.data_cache.pop_front().unwrap();
         self.match_orders(&depth);
-        responder.normal_response(sonic_rs::to_string(&depth).unwrap())
+        let tick_response = TickResponse {
+            depth,
+            account: self.account.clone(),
+        };
+        BacktestResponse::normal_response(sonic_rs::to_string(&tick_response).unwrap())
     }
 
     // return cid when success
     pub fn post_order(&mut self, order: Order) -> BacktestResponse {
-        let post_value = order.price * order.amount;
-        // check account balance, if not enough, return an error statu
-        if self.account.balance.get_available() < post_value {
-            return BacktestResponse {
-                backtest_id: self.account.backtest_id.clone(),
-                status: "error".to_string(),
-                message: "insufficient balance".to_string(),
-            };
+        info!("{:?}", order);
+        let amount = order.amount;
+        let post_value = order.price * amount;
+        // check account balance, if not enough, return an error status
+        if self.account.balance.get_available() < post_value && order.side == OrderSide::Buy {
+            return BacktestResponse::bad_request("Insufficient balance.".to_string());
+        }
+        // bugs should add freezed amount
+        if self.account.position.amount_available < order.amount && order.side == OrderSide::Sell {
+            return BacktestResponse::bad_request("Insufficient amount.".to_string());
         }
         let cid = order.cid.clone();
-
         self.order_list
             .insert_order(self.latency.order_with_latency(order));
         // update account
+        self.account.position.add_freezed(amount);
         self.account.balance.add_freezed(post_value);
 
-        BacktestResponse {
-            backtest_id: self.account.backtest_id.clone(),
-            status: "ok".to_string(),
-            message: format!("cid: {} order posted.", cid),
-        }
+        BacktestResponse::normal_response(format!("cid: {} order posted.", cid))
     }
 
     pub fn cancel_order(&mut self, cid: String) -> BacktestResponse {
@@ -208,45 +219,41 @@ impl ZileanV1 {
         let order = self.order_list.remove_order(cid);
 
         if let Some(order) = order {
-            let value = order.price * order.amount;
+            let amount = order.amount - order.filled_amount;
+            let value = order.price * amount;
             self.account.balance.sub_freezed(value);
-
+            self.account.position.sub_freezed(amount);
             // return an ok status response
-            BacktestResponse {
-                backtest_id: self.account.backtest_id.clone(),
-                status: "ok".to_string(),
-                message: format!("cid: {} order canceled.", order.cid),
-            }
+            BacktestResponse::normal_response(format!("cid: {} order canceled.", order.cid))
         } else {
             // cancel order not found
             // return an error status response
-            BacktestResponse {
-                backtest_id: self.account.backtest_id.clone(),
-                status: "error".to_string(),
-                message: "order not found".to_string(),
-            }
+            BacktestResponse::bad_request("Order not found".to_string())
         }
     }
 
     fn match_orders(&mut self, depth: &Depth) {
         // when tick update, try to match orders
         let filled_stack = self.order_list.execute_orders(depth);
+        if !filled_stack.is_empty() {
+            info!("{:?}", filled_stack);
+        }
         for filled in filled_stack {
             self.account
                 .position
                 .update_pos(filled.filled_price, filled.filled_amount);
+            self.account
+                .balance
+                .fill_freezed(filled.filled_price * filled.filled_amount);
         }
     }
 
     // controller for backtest server
-    async fn start_listening(&mut self) {
+    async fn start_listening(&mut self, tick_url: &str) {
         // start zmq server here, listen on ipc:///tmp/zilean_backtest/{backtest_id}.ipc
         let context = Context::new();
         let responder = context.socket(zmq::REP).unwrap();
-        let url = format!(
-            "ipc:///tmp/zilean_backtest/{}.ipc",
-            self.account.backtest_id
-        );
+        let url = format!("{}{}.ipc", tick_url, self.account.backtest_id);
 
         //timeout setting
         responder
@@ -272,14 +279,13 @@ impl ZileanV1 {
                 Err(e) => {
                     // connection interrupted
                     if e.to_string().contains("Resource temporarily unavailable") {
-                        info!("connection {} recvtimeout.", self.account.backtest_id);
+                        info!("Connection {} recv timeout.", self.account.backtest_id);
                         break;
                     }
-                    let response = sonic_rs::to_string(&BacktestResponse {
-                        backtest_id: (-1).to_string(),
-                        status: "error".to_string(),
-                        message: "error prasing command:".to_string() + e.to_string().as_str(),
-                    })
+                    let response = sonic_rs::to_string(&BacktestResponse::bad_request(format!(
+                        "Error prasing string, {}.",
+                        e
+                    )))
                     .unwrap();
                     let _ = responder.send(response.as_str(), 0);
                     continue;
@@ -292,31 +298,14 @@ impl ZileanV1 {
                     sonic_rs::to_string(&tick).expect("Failed to serialize tick data");
                 responder
                     .send(tick_response.as_str(), 0)
-                    .expect("Failed to send tick data");
-            } else if message.starts_with("GET_ACCOUNT_INFO") {
-                let tick_response = BacktestResponse {
-                    backtest_id: self.account.backtest_id.clone(),
-                    status: "ok".to_string(),
-                    message: sonic_rs::to_string(&self.account)
-                        .expect("Failed to serialize tick data"),
-                };
-                responder
-                    .send(
-                        sonic_rs::to_string(&tick_response)
-                            .expect("Failed to serialize tick data")
-                            .as_str(),
-                        0,
-                    )
-                    .expect("Failed to send tick data");
+                    .expect("Failed to send tick data.");
             } else if let Some(stripped) = message.strip_prefix("POST_ORDER") {
                 let order: Order = match sonic_rs::from_str(stripped) {
                     Ok(order) => order,
                     Err(e) => {
-                        let response = sonic_rs::to_string(&BacktestResponse {
-                            backtest_id: (-1).to_string(),
-                            status: "error".to_string(),
-                            message: "error prasing order:".to_string() + e.to_string().as_str(),
-                        })
+                        let response = sonic_rs::to_string(&BacktestResponse::bad_request(
+                            format!("Error parsing order: {}", e),
+                        ))
                         .unwrap();
                         let _ = responder.send(response.as_str(), 0);
                         continue;
@@ -331,17 +320,35 @@ impl ZileanV1 {
                 let response = sonic_rs::to_string(&response).unwrap();
                 let _ = responder.send(response.as_str(), 0);
             } else if message.starts_with("CLOSE") {
-                // TODO close the server
+                let response = sonic_rs::to_string(&BacktestResponse::normal_response(
+                    "Server closed.".to_string(),
+                ))
+                .unwrap();
                 responder
-                    .send("ok", 0)
-                    .expect("Failed to send unknown command response");
+                    .send(response.as_str(), 0)
+                    .expect("Failed to send unknown command response.");
                 break;
             } else {
+                let response = sonic_rs::to_string(&BacktestResponse::bad_request(
+                    "Unknown command.".to_string(),
+                ))
+                .unwrap();
                 responder
-                    .send("Unknown command", 0)
-                    .expect("Failed to send unknown command response");
+                    .send(response.as_str(), 0)
+                    .expect("Failed to send unknown command response.");
             }
         }
+        self.close_bt(responder, tick_url).await;
+    }
+
+    async fn close_bt(&mut self, responder: zmq::Socket, tick_url: &str) {
+        info!(
+            "Closing backtest server for id: {}.",
+            self.account.backtest_id
+        );
+        responder
+            .disconnect(format!("{}{}.ipc", tick_url, self.account.backtest_id).as_str())
+            .unwrap();
     }
 }
 
