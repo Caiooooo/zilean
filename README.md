@@ -1,6 +1,6 @@
 # Zilean Backtest Engine
 
-Zilean is a high-performance backtesting engine designed for cryptocurrency quantitative trading strategies. It enables efficient backtesting of various trading algorithms, providing a robust environment to evaluate and improve trading strategies using real market data. This README will guide you through setting up, running, and extending Zilean.
+Zilean is a high-performance backtesting engine designed for cryptocurrency quantitative trading strategies. It enables efficient backtesting of various trading algorithms, providing a robust environment to evaluate and improve trading strategies using real market data.
 
 ## Features
 - High-speed backtesting for cryptocurrency markets
@@ -70,14 +70,9 @@ When pushing for low latency (e.g., below 10 microseconds for IPC), it's recomme
 - Avoid unnecessary data serialization/deserialization
 - Profile and optimize both server-side (Rust) and client-side (Python) implementations
 
-
-## Contact
-If you have any questions or suggestions regarding the Zilean project, feel free to reach out by opening an issue on GitHub.
-
 ## TODO
 - Support futures contract backtesting
 - Implement support for market orders and limit IOC (Immediate-Or-Cancel) orders
 - Expand data sources and improve integration with new exchanges
 - Add more advanced latency models and risk management features
 - Improve the visualization of backtest results with charts and analytics
-
