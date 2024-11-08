@@ -4,8 +4,8 @@ StartLimitIntervalSec=300
 StartLimitBurst=60
 
 [Service]
-ExecStart=/home/xxy/bin/zilean
-WorkingDirectory=/home/xxy/bin
+ExecStart=/tmp/bin
+WorkingDirectory=/tmp/bin
 Environment=RUST_BACKTRACE=1
 UMask=000
 

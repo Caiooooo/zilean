@@ -7,5 +7,5 @@ host = "http://localhost"
 port = 8123
 database = "orderbook"
 username = "default"
-password = ""
+password = "RyQplVJetI2M"
 

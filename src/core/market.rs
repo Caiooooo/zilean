@@ -1,3 +1,4 @@
+use crate::engine::*;
 use clickhouse::Row;
 use sonic_rs::{Deserialize, Serialize};
 
@@ -11,28 +12,28 @@ pub enum Exchange {
 }
 
 // version1.0 only support limit order
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub enum OrderType {
     #[default]
     Limit,
     Market,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub enum TimeInForce {
     #[default]
     Gtc,
     Ioc,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Clone)]
 pub enum OrderSide {
     #[default]
     Buy,
     Sell,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Clone)]
 pub enum OrderState {
     #[default]
     Open,
@@ -63,9 +64,16 @@ impl Balance {
         self.available += value;
     }
 
-    pub fn fill_freezed(&mut self, value: f64) {
-        self.total -= value;
-        self.freezed -= value;
+    pub fn fill_freezed(&mut self, price: f64, amount: f64, freeze_price: f64) {
+        // buy coin, amount > 0
+        // debug!("fill_freezed: price: {}, amount: {}, freeze_price: {}", price, amount, freeze_price);
+        self.total -= price * amount;
+        if amount > 0.0 {
+            self.freezed -= freeze_price * amount;
+            self.available += (freeze_price - price) * amount;
+        } else {
+            self.available -= price * amount;
+        }
     }
 }
 
@@ -91,8 +99,8 @@ pub struct Account {
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
+// only support one exchange and one symbol
 pub struct Position {
-    pub exchange: Exchange,
     pub symbol: String,
     // side: PositionSide,
     pub amount_total: f64,
@@ -128,26 +136,48 @@ impl Position {
             self.amount_freezed += value;
         }
     }
+
+    pub fn round(&mut self) {
+        self.amount_freezed = (self.amount_freezed * 100000.0).round() / 100000.0;
+        self.amount_available = (self.amount_available * 100000.0).round() / 100000.0;
+        self.amount_total = (self.amount_total * 100000.0).round() / 100000.0;
+    }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+// skip: ignore this field when serialize, single exchange don't need this field
+// skip can be removed when need to support multiple exchanges
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Order {
+    #[serde(skip_serializing)]
     pub exchange: Exchange,
     pub cid: String,
+    #[serde(skip_serializing)]
     pub symbol: String,
     pub price: f64,
     pub amount: f64,
     pub filled_amount: f64,
+    #[serde(default = "default_amount", skip)]
+    pub front_amount: f64,
+    #[serde(default = "default_depth", skip)]
+    pub prev_depth: Depth,
     pub avg_price: f64,
     pub side: OrderSide,
     pub state: OrderState,
+    #[serde(skip_serializing)]
     pub order_type: OrderType,
+    #[serde(skip_serializing)]
     pub time_in_force: TimeInForce,
     pub timestamp: i64,
 }
+fn default_amount() -> f64 {
+    -1.0
+}
+fn default_depth() -> Depth {
+    Depth::default()
+}
 
 impl Order {
-    pub fn execute(&mut self, depth: &Depth) -> (f64, f64) {
+    pub fn execute(&mut self, depth: &Depth, fill_model: FillModel) -> (f64, f64) {
         let mut avg_price = 0.0;
         let mut executed_amount = 0.0;
         let mut executed_value = 0.0;
@@ -155,34 +185,60 @@ impl Order {
         let mut pos_coefficient = 1.0;
         match self.side {
             OrderSide::Buy => {
-                for ask in depth.asks.iter() {
-                    if ask.0 > self.price || rest_amount <= 0.0 {
-                        break;
+                // Maintain an execution position queue
+                if depth.asks[0].0 > self.price && rest_amount > 0.0 {
+                    let exe_amount = self.update_front_amount(depth, fill_model);
+                    if exe_amount != 0.0 {
+                        executed_amount += exe_amount;
+                        executed_value += exe_amount * self.price;
+                        avg_price = executed_value / executed_amount;
                     }
-                    let amount_to_execute = rest_amount.min(ask.1);
-                    executed_amount += amount_to_execute;
-                    executed_value += amount_to_execute * ask.0;
-                    avg_price = executed_value / executed_amount;
-                    rest_amount -= amount_to_execute;
+                } else {
+                    for ask in depth.asks.iter() {
+                        if ask.0 > self.price || rest_amount <= 0.0 {
+                            break;
+                        }
+                        self.front_amount = 0.0;
+                        let amount_to_execute = rest_amount.min(ask.1);
+                        executed_amount += amount_to_execute;
+                        executed_value += amount_to_execute * ask.0;
+                        avg_price = executed_value / executed_amount;
+                        rest_amount -= amount_to_execute;
+                    }
                 }
             }
             OrderSide::Sell => {
-                for bid in depth.bids.iter() {
-                    if bid.0 < self.price || rest_amount <= 0.0 {
-                        break;
+                if depth.bids[0].0 < self.price && rest_amount > 0.0 {
+                    let exe_amount = self.update_front_amount(depth, fill_model);
+                    if exe_amount != 0.0 {
+                        executed_amount += exe_amount;
+                        executed_value += exe_amount * self.price;
+                        avg_price = executed_value / executed_amount;
                     }
-                    let amount_to_execute = rest_amount.min(bid.1);
-                    executed_amount += amount_to_execute;
-                    executed_value += amount_to_execute * bid.0;
-                    avg_price = executed_value / executed_amount;
-                    rest_amount -= amount_to_execute;
+                } else {
+                    for bid in depth.bids.iter() {
+                        if bid.0 < self.price || rest_amount <= 0.0 {
+                            break;
+                        }
+                        let amount_to_execute = rest_amount.min(bid.1);
+                        executed_amount += amount_to_execute;
+                        executed_value += amount_to_execute * bid.0;
+                        avg_price = executed_value / executed_amount;
+                        rest_amount -= amount_to_execute;
+                    }
+                    pos_coefficient = -1.0;
                 }
-                pos_coefficient = -1.0;
             }
         }
 
-        self.filled_amount = executed_amount;
-        self.avg_price = avg_price;
+        // this is out of most max precision of post, so it won't change the result
+        executed_amount = (executed_amount * 1000000.0).round() / 1000000.0;
+        avg_price = (avg_price * 100000.0).round() / 100000.0;
+        if avg_price > 0.0 {
+            self.avg_price = (avg_price * executed_amount + self.avg_price * self.filled_amount)
+                / (self.filled_amount + executed_amount);
+        }
+        self.filled_amount += executed_amount;
 
         if self.filled_amount == self.amount {
             self.state = OrderState::Filled;
@@ -192,6 +248,103 @@ impl Order {
 
         (avg_price, executed_amount * pos_coefficient)
     }
+
+    // return amount to be filled
+    #[allow(clippy::needless_return)]
+    fn update_front_amount(&mut self, new_depth: &Depth, fill_model: FillModel) -> f64 {
+        // init amount
+        if self.front_amount < 0.0 {
+            self.front_amount = 0.0;
+            match self.side {
+                OrderSide::Buy => {
+                    for ask in new_depth.asks.iter() {
+                        if ask.0 <= self.price {
+                            self.front_amount = ask.1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                OrderSide::Sell => {
+                    for bid in new_depth.bids.iter() {
+                        if bid.0 >= self.price {
+                            self.front_amount = bid.1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            self.prev_depth = new_depth.clone();
+            return 0.0;
+        }
+        let mut prev_amount = 0.0;
+        let mut new_amount = 0.0;
+        match self.side {
+            OrderSide::Buy => {
+                for ask in new_depth.asks.iter() {
+                    if ask.0 <= self.price {
+                        new_amount = ask.1;
+                        continue;
+                    }
+                    break;
+                }
+                for ask in self.prev_depth.asks.iter() {
+                    if ask.0 <= self.price {
+                        prev_amount = ask.1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            OrderSide::Sell => {
+                for bid in new_depth.bids.iter() {
+                    if bid.0 >= self.price {
+                        new_amount = bid.1;
+                        continue;
+                    }
+                    break;
+                }
+                for bid in self.prev_depth.bids.iter() {
+                    if bid.0 >= self.price {
+                        prev_amount = bid.1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        };
+        let chg = prev_amount - new_amount;
+        if chg < 0.0 {
+            self.front_amount = self.front_amount.min(new_amount);
+            return 0.0;
+        }
+
+        let front = self.front_amount;
+        let back = prev_amount - front;
+
+        let mut prob = fill_model.prob(back, front);
+        if prob > 1.0 || prob.is_infinite() {
+            prob = 1.0;
+        }
+        let new_front = front - (1.0 - prob) * chg + (back - prob * chg).min(0.0);
+        self.front_amount = new_front.min(new_amount).min(0.0);
+        // match success on front amount update
+        if self.front_amount < 1e-6
+            && ((self.side == OrderSide::Buy && (self.price - new_depth.bids[0].0).abs() < 1e-6)
+                || (self.side == OrderSide::Sell
+                    && (new_depth.asks[0].0 - self.price).abs() < 1e-6))
+        {
+            let mut ret = chg;
+
+            if chg > self.amount - self.filled_amount {
+                ret = self.amount - self.filled_amount;
+            }
+            ret = (ret * 100000.0).round() / 100000.0;
+            return ret;
+        }
+        return 0.0;
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -200,7 +353,7 @@ pub struct Level {
     amount: f64,
 }
 
-#[derive(Default, Deserialize, Serialize, Row, Debug)]
+#[derive(Default, Deserialize, Serialize, Row, Debug, Clone)]
 pub struct Depth {
     #[serde(deserialize_with = "deserialize_exchange")]
     pub exchange: Exchange,
@@ -222,10 +375,13 @@ where
         "coinbase" => Ok(Exchange::CoinbaseSpot),
         "kraken" => Ok(Exchange::KrakenSpot),
         "okx" => Ok(Exchange::OkxSpot),
+        "okex" => Ok(Exchange::OkxSpot),
         "BinanceSpot" => Ok(Exchange::BinanceSpot),
         "CoinbaseSpot" => Ok(Exchange::CoinbaseSpot),
         "KrakenSpot" => Ok(Exchange::KrakenSpot),
         "OkxSpot" => Ok(Exchange::OkxSpot),
+        "OkexSpot" => Ok(Exchange::OkxSpot),
+
         // 更多匹配
         _ => Err(serde::de::Error::custom(format!("Unknown exchange: {}", s))),
     }

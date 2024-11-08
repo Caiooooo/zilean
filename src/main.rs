@@ -4,7 +4,6 @@ use logger::init_logger;
 use server::{BacktestResponse, ZileanServer};
 use zilean::*;
 use zmq::Context;
-use ZConfig;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {

@@ -26,11 +26,12 @@ pub struct DataLoader {
     database: Option<DatabaseAccount>,
     source: DataSource,
     limit: usize,
-    offset: usize,
+    limit_ratio: f32,
+    last_timestamp: usize,
 }
 
 impl DataLoader {
-    pub fn new(limit: usize, config: &BtConfig) -> DataLoader {
+    pub async fn new(limit: usize, config: &BtConfig) -> DataLoader {
         let config_clone = config.clone();
         let source = match config.source.clone() {
             Some(source) => source,
@@ -40,12 +41,42 @@ impl DataLoader {
             DataSource::Database => Some(config::ZConfig::parse("config.toml").database),
             _ => None,
         };
+        // init the start time
+        let mut start_time = config.start_time;
+        if let Some(conf) = database.clone() {
+            let client = Client::default()
+                .with_url(format!("{}:{}", conf.host, conf.port))
+                .with_user(conf.username)
+                .with_password(conf.password)
+                .with_database(conf.database);
+            let ret = client
+                .query("SELECT ?fields FROM ? LIMIT 1")
+                .bind(Identifier(
+                    format!("{}_spot", &config.symbol.split("_").next().unwrap())
+                        .to_lowercase()
+                        .as_str(),
+                ))
+                .fetch_all::<Depth>().await;
+            // println!("start time: {:?}", ret);
+            match ret {
+                Ok(data) => {
+                    if !data.is_empty() {
+                        start_time = data.first().unwrap().local_timestamp.max(start_time);
+                    }
+                }
+                Err(e) => {
+                    error!("query failed invailed time: {:?}", e);
+                }
+            }
+        }
+        // limit_ratio will adjust dymatically according to the data size, 10 for fast start
         DataLoader {
             config: config_clone,
             database,
             source,
             limit,
-            offset: 0,
+            limit_ratio: 1000.0,
+            last_timestamp: start_time as usize,
         }
     }
     pub async fn load_data(&mut self) -> Result<Vec<Depth>, std::io::Error> {
@@ -63,18 +94,28 @@ impl DataLoader {
             .with_password(dbconf.password)
             .with_database(dbconf.database);
 
-        let exchange_list: Vec<String> = self.config.exchanges.iter().map(|ex| match ex {
+        let mut exchange_list: Vec<String> = self.config.exchanges.iter().map(|ex| match ex {
             Exchange::BinanceSpot => "binance".to_string(),
             Exchange::CoinbaseSpot => "coinbase".to_string(),
             Exchange::OkxSpot => "okx".to_string(),
             Exchange::KrakenSpot => "kraken".to_string(),
         }).collect();
+        if exchange_list.contains(&"okx".to_string()){
+            exchange_list.push("okex".to_string());
+        }
 
+        if self.config.end_time < 0{
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "invalid end time, end time should be grater than 0.",
+            ));
+        }
+        let end_time = (self.last_timestamp + self.limit * self.limit_ratio as usize).min(self.config.end_time as usize);
         let ret = 
             // TODO 支持期货查询
             client
                 .query(
-                    "SELECT ?fields FROM ? WHERE exchange IN (?) AND exch_timestamp >= ? AND exch_timestamp < ? ORDER BY local_timestamp LIMIT ? OFFSET ?",
+                    "SELECT ?fields FROM ? WHERE exchange IN (?) AND local_timestamp >= ? AND local_timestamp < ? ORDER BY local_timestamp LIMIT ?",
                 )
                 .bind(Identifier(
                     format!("{}_spot", &self.config.symbol.split("_").next().unwrap())
@@ -82,16 +123,20 @@ impl DataLoader {
                         .as_str(),
                 ))
                 .bind(exchange_list)
-                .bind(self.config.start_time)
-                .bind(self.config.end_time)
+                .bind(self.last_timestamp)
+                .bind(end_time)
                 .bind(self.limit)
-                .bind(self.offset)
                 .fetch_all::<Depth>()
                 .await;
         match ret {
             Ok(data) => {
                 debug!("query success");
-                self.offset += self.limit;
+                if !data.is_empty() {
+                    if data.len() < self.limit{
+                        self.limit_ratio *= (self.limit as f32/ data.len() as f32).min(20.0) ; // slow start
+                    }
+                    self.last_timestamp = data.last().unwrap().local_timestamp as usize + 1;
+                }
                 Ok(data)
             }
             Err(e) => {
@@ -116,6 +161,6 @@ mod tests {
     #[tokio::test]
     async fn test_data_loader() {
         let config = BtConfig::default();
-        DataLoader::new(10_000, &config).load_data().await.unwrap();
+        DataLoader::new(10_000, &config).await.load_data().await.unwrap();
     }
 }
