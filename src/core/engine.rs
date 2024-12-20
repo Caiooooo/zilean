@@ -1,15 +1,16 @@
 use crate::dataloader::DataSource;
 use crate::market::*;
+use crate::round::round6;
 use rand::Rng;
 // use rustc_hash::FxHashMap;
-use log::{info, debug};
+use super::{dataloader::DataLoader, server::BacktestResponse};
+use log::{debug, info};
+use rand_distr::{Distribution, Normal};
 use sonic_rs::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use zmq::Context;
-use rand_distr::{Normal, Distribution};
-use super::{dataloader::DataLoader, server::BacktestResponse};
 
 #[derive(Debug, Default, PartialEq)]
 pub enum BacktestState {
@@ -73,9 +74,8 @@ pub enum FillModel {
     LogProbQueueFunc,
 }
 
-impl FillModel{
-
-    pub fn prob(&self, back: f64, front:f64) -> f64{
+impl FillModel {
+    pub fn prob(&self, back: f64, front: f64) -> f64 {
         match self {
             FillModel::None => 1.0,
             FillModel::Random(min, max) => rand::thread_rng().gen_range(*min..*max),
@@ -84,9 +84,7 @@ impl FillModel{
                 let front_power = front.powf(*n);
                 back_power / (back_power + front_power)
             }
-            FillModel::PowerProbQueueFunc2(n) => {
-                back.powf(*n) / (back + front).powf(*n)
-            }
+            FillModel::PowerProbQueueFunc2(n) => back.powf(*n) / (back + front).powf(*n),
             FillModel::PowerProbQueueFunc3(n) => {
                 // println!("back: {}, front: {}, prob: {}", back, front, 1.0 - (front / (front + back)).powf(*n));
                 1.0 - (front / (front + back)).powf(*n)
@@ -141,50 +139,74 @@ impl OrderList {
         None
     }
 
-    pub fn execute_orders(&mut self, depth: &Depth, fill_model:FillModel) -> Vec<FilledStack> {
+    pub fn execute_orders(&mut self, depth: &Depth, fill_model: FillModel) -> Vec<FilledStack> {
+        // println!("{:?}", self.inner);
         let mut filled = vec![];
         self.inner.retain_mut(|order| {
             if order.state == OrderState::Canceled || order.state == OrderState::Filled {
                 // keep this order for seconds after it is filled or canceled, then remove it in case of latency
                 //  magic number: 3_000_000 mean 3 s
-                if order.timestamp + 9_000_000 < depth.timestamp{
+                if order.timestamp + 3_100_000 < depth.local_timestamp {
                     return false;
                 }
                 return true;
             }
-            // info!("depth.timestamp: {:?}, order.timestamp: {:?}", depth.timestamp, order.timestamp);
-            if depth.timestamp < order.timestamp || order.exchange != depth.exchange {
+            // info!("depth.timestamp: {:?}, order.timestamp: {:?}", depth.local_timestamp, order.timestamp);
+            if depth.local_timestamp < order.timestamp || order.exchange != depth.exchange {
                 return true; // keep this order
             }
             let (filled_price, filled_amount) = order.execute(depth, fill_model.clone());
+
             if filled_price != 0.0 {
                 filled.push(FilledStack {
+                    cid: order.cid.clone(),
                     exchange: order.exchange,
                     symbol: order.symbol.clone(),
+                    contract_type: order.contract_type.clone(),
+                    side: order.position_side.clone(),
+                    leverage: order.leverage,
+                    take_profit: order.take_profit,
+                    stop_loss: order.stop_loss,
                     filled_price,
                     filled_amount,
                     post_price: order.price,
+                    freeze_margin: order.margin,
+                    amount_total: order.amount,
                 });
             }
             true
         });
-
         filled
     }
 }
 
 #[derive(Debug)]
 pub struct FilledStack {
+    pub cid: String,
     pub exchange: Exchange,
     pub symbol: String,
+    pub side: PositionSide,
+    pub contract_type: ContractType,
+    pub leverage: u32,
+    pub take_profit: Option<f64>,
+    pub stop_loss: Option<f64>,
     pub filled_price: f64,
     pub filled_amount: f64,
     pub post_price: f64,
+    pub freeze_margin: f64,
+    pub amount_total: f64,
 }
 
 #[derive(Serialize, Default)]
-pub struct TickResponse {
+pub struct TickResponseDepth {
     pub depth: Depth,
+    pub account: Account,
+    pub orders: OrderList,
+}
+
+#[derive(Serialize, Default)]
+pub struct TickResponseTrade {
+    pub trade: Trade,
     pub account: Account,
     pub orders: OrderList,
 }
@@ -197,6 +219,8 @@ pub struct ZileanV1 {
     account: Account,
     data_loader: Arc<Mutex<DataLoader>>,
     data_cache: VecDeque<Depth>,
+    trade_cache: VecDeque<Trade>,
+    next_tick: String,
     latency: LatencyModel,
     fill_model: FillModel,
     state: BacktestState,
@@ -210,13 +234,14 @@ impl ZileanV1 {
             // trade: Trade::default(),
             order_list: OrderList::default(),
             account: Account::default(),
-            data_loader: Arc::new(Mutex::new(DataLoader::new(1_000_000, &config).await)),
+            data_loader: Arc::new(Mutex::new(DataLoader::new(500_000, &config).await)),
             data_cache: VecDeque::new(),
-            // TODO multiple latency model
+            trade_cache:VecDeque::new(),
             latency: LatencyModel::Fixed(20),
             fill_model: FillModel::PowerProbQueueFunc3(3.0),
             state: BacktestState::default(),
             depth: Depth::default(),
+            next_tick: "".to_string(),
         }
     }
 
@@ -228,22 +253,26 @@ impl ZileanV1 {
         self.prepare_data().await?;
         self.account.backtest_id = backtest_id;
         self.account.balance = self.config.balance.clone();
-        self.account.position.symbol = self.config.symbol.clone().split("_").next().unwrap().to_string();
-        self.state = BacktestState::Running;
+        // self.account.position.symbol = self.config.symbol.clone().split("_").next().unwrap().to_string();
         self.start_listening(tick_url).await;
         Ok(())
     }
 
     async fn prepare_data(&mut self) -> Result<(), std::io::Error> {
         let data_loader = self.data_loader.clone();
-
+        let data_loader2 = self.data_loader.clone();
         let handle = tokio::spawn(async move { data_loader.lock().await.load_data().await });
-
+        let handle2 = tokio::spawn(async move { data_loader2.lock().await.load_trade().await });
+        
         // read the first block of data or the first file data into data_cache
         self.data_cache = VecDeque::from(handle.await??);
-        if let Some(depth) = self.data_cache.pop_front(){
+        if let Some(depth) = self.data_cache.pop_front() {
             self.depth = depth;
         }
+        self.trade_cache = VecDeque::from(handle2.await??);
+        self.state = BacktestState::Running;
+        let tick = self.on_tick().await;
+        self.next_tick = sonic_rs::to_string(&tick).expect("Failed to serialize tick data");
         Ok(())
     }
 
@@ -274,6 +303,39 @@ impl ZileanV1 {
                 return BacktestResponse::bad_request("No more data, backtestfinished".to_string());
             }
         }
+        if self.trade_cache.is_empty() {
+            let data_loader = self.data_loader.clone();
+            // fill the cache with new data
+            let handle = tokio::spawn(async move { data_loader.lock().await.load_trade().await });
+            match handle.await {
+                Ok(Ok(data)) => {
+                    self.trade_cache = VecDeque::from(data);
+                }
+                Ok(Err(e)) => {
+                    return BacktestResponse::bad_request(format!("Error loading data: {}", e));
+                }
+                Err(e) => {
+                    return BacktestResponse::bad_request(format!("Error loading data: {}", e));
+                }
+            }
+
+            if self.trade_cache.is_empty() {
+                self.state = BacktestState::Finished;
+                // dont change the return message
+                return BacktestResponse::bad_request("No more data, backtestfinished".to_string());
+            }
+        } 
+        let is_trade = matches!(self.trade_cache.front().unwrap().local_timestamp.cmp(&self.data_cache.front().unwrap().local_timestamp), std::cmp::Ordering::Less);
+        if is_trade{
+            let trade = self.trade_cache.pop_front().unwrap();
+            let tick_response = TickResponseTrade {
+                trade,
+                account: self.account.clone(),
+                orders: self.order_list.clone(),
+            };
+            self.match_orders();
+            return BacktestResponse::normal_response(sonic_rs::to_string(&tick_response).unwrap());
+        }
         let mut depth = self.data_cache.pop_front().unwrap();
         for ask in depth.asks.iter_mut() {
             ask.1 = (ask.1 * 100000.0).round() / 100000.0;
@@ -282,55 +344,279 @@ impl ZileanV1 {
             bids.1 = (bids.1 * 100000.0).round() / 100000.0;
         }
         // level 0 changed, trades happened, match orders
-        if self.depth.asks[0].0 != depth.asks[0].0 {
-            self.match_orders(&depth);
+        self.depth = depth.clone();
+        for position in self.account.position.iter_mut() {
+            position.1.round();
+            // check Forced Liquidation and stop loss
         }
-        self.account.position.round();
-        let tick_response = TickResponse {
-            depth,
+        self.close_order_check(&self.depth.clone());
+        let tick_response = TickResponseDepth {
+            depth: self.depth.clone(),
             account: self.account.clone(),
             orders: self.order_list.clone(),
         };
         BacktestResponse::normal_response(sonic_rs::to_string(&tick_response).unwrap())
     }
 
+    // check for forced liquidation and stop loss conditions
+    fn close_order_check(&mut self, depth: &Depth) {
+        let mut close_list: Vec<Order> = Vec::new();
+    
+        // Check Long positions
+        let position_long = self
+            .account
+            .position
+            .get_mut(&(depth.symbol.clone(), PositionSide::Long, depth.exchange));
+        let mut total_amount = 0.0;
+        let mid_price = (depth.asks[0].0 + depth.bids[0].0) / 2.0;
+    
+        if let Some(position) = position_long {
+    
+            // Sort the position by stop_loss price (ascending)
+            position.stop_loss.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    
+            for (index, loss) in position.stop_loss.iter_mut().enumerate() {
+                total_amount += loss.1;
+                if mid_price < loss.0 {
+                    let stop_loss_order = Order {
+                        contract_type: ContractType::Futures,
+                        symbol: depth.symbol.clone(),
+                        exchange: depth.exchange,
+                        order_type: OrderType::Market,
+                        position_side: PositionSide::Long,
+                        leverage: position.leverage,
+                        cid: "st-".to_string() + depth.symbol.clone().as_str(),
+                        price: 0.0,
+                        amount: loss.1,
+                        side: OrderSide::Sell,
+                        timestamp: 0,
+                        ..Default::default()
+                    };
+                    close_list.push(stop_loss_order);
+                }
+                if total_amount >= position.amount_total {
+                    // 只清除未遍历的部分
+                    position.stop_loss.drain(index + 1..);
+                    break;
+                }
+            }
+        }
+    
+        // Check Short positions
+        let position_short = self
+            .account
+            .position
+            .get_mut(&(depth.symbol.clone(), PositionSide::Short, depth.exchange));
+        total_amount = 0.0;
+    
+        if let Some(position) = position_short {
+    
+            // Sort the position by stop_loss price (descending)
+            position.stop_loss.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    
+            for (index, loss) in position.stop_loss.iter_mut().enumerate() {
+                total_amount += loss.1;
+                if mid_price > loss.0 {
+                    let stop_loss_order = Order {
+                        contract_type: ContractType::Futures,
+                        symbol: depth.symbol.clone(),
+                        exchange: depth.exchange,
+                        order_type: OrderType::Market,
+                        position_side: PositionSide::Short,
+                        leverage: position.leverage,
+                        cid: "st-".to_string() + depth.symbol.clone().as_str(),
+                        price: 1000000.0,
+                        amount: loss.1,
+                        side: OrderSide::Sell,
+                        timestamp: 0,
+                        ..Default::default()
+                    };
+                    close_list.push(stop_loss_order);
+                }
+                if total_amount >= position.amount_total {
+                    // Clear all stop-loss orders
+                    position.stop_loss.drain(index + 1..);
+                    break;
+                }
+            }
+        }
+    
+        // Force close all remaining positions with market price if necessary
+        for position_side in &[PositionSide::Long, PositionSide::Short] {
+            if let Some(position) = self.account.position.get_mut(&(depth.symbol.clone(), position_side.clone(), depth.exchange)) {
+                let mut margin_left = position.margin_value;
+                let mut price = 0.0;
+                match position_side {
+                    PositionSide::Long=>{
+                        margin_left += (mid_price - position.entry_price) * position.amount_total;
+                    }
+                    PositionSide::Short=>{
+                        price = 1000000.0;
+                        margin_left -= (mid_price - position.entry_price) * position.amount_total;
+                    }
+                };
+                if margin_left <= 0.0 {
+                    let force_close_order = Order {
+                        contract_type: ContractType::Futures,
+                        symbol: depth.symbol.clone(),
+                        exchange: depth.exchange,
+                        order_type: OrderType::Market,
+                        position_side: position_side.clone(),
+                        leverage: position.leverage,
+                        cid: "fc-".to_string() + depth.symbol.clone().as_str(),
+                        price,
+                        amount: position.amount_total,
+                        side: OrderSide::Sell,
+                        timestamp: 0,
+                        ..Default::default()
+                    };
+                    close_list.push(force_close_order);
+                    position.amount_total = 0.0; // Ensure the total is reset
+                    position.stop_loss.clear(); // Clear stop-loss
+                }
+            }
+        }
+    
+        // Process all close orders
+        for order in close_list {
+            self.post_order(order);
+        }
+    }
+
     // return cid when success
-    pub fn post_order(&mut self,mut order: Order) -> BacktestResponse {
+    pub fn post_order(&mut self, mut order: Order) -> BacktestResponse {
         debug!("{:?}", order);
-        // check account balance, if not enough, return an error status
+        // check account balance, fix the amount and price
         if (order.amount - ((order.amount * 100000.0).round() / 100000.0)).abs() >= 1e-7 {
             return BacktestResponse::bad_request("Invalid amount.".to_string());
         }
         if (order.price - ((order.price * 100000.0).round() / 100000.0)).abs() >= 1e-7 {
             return BacktestResponse::bad_request("Invalid amount.".to_string());
         }
-        order.amount = (order.amount * 100000.0).round() / 100000.0;
-        order.price = (order.price * 100000.0).round() / 100000.0;
-        let amount = order.amount;
-        let post_value = order.price * amount;
-        if self.account.balance.get_available() < post_value && order.side == OrderSide::Buy {
-            return BacktestResponse::bad_request("Insufficient balance.".to_string());
-        }
-        // bugs should add freezed amount
-        if self.account.position.amount_available < order.amount && order.side == OrderSide::Sell {
-            return BacktestResponse::bad_request("Insufficient amount.".to_string());
-        }
         if order.price <= 0.0 || order.amount <= 0.0 {
             return BacktestResponse::bad_request("Invalid order.".to_string());
         }
 
+        order.amount = (order.amount * 100000.0).round() / 100000.0;
+        order.price = (order.price * 100000.0).round() / 100000.0;
+        let amount = order.amount;
+        let post_value = order.price * amount;
+        // check margin for Spot
+        if order.contract_type == ContractType::Spot {
+            // Get the position for the symbol or insert a new one if it doesn't exist
+            let position = self
+                .account
+                .position
+                .entry((order.symbol.clone(), order.position_side.clone(),order.exchange))
+                .or_default();
+
+            match order.side {
+                OrderSide::Sell => {
+                    if position.amount_available < order.amount {
+                        return BacktestResponse::bad_request("Insufficient amount.".to_string());
+                    }
+                    position.add_freezed(order.amount);
+                }
+                OrderSide::Buy => {
+                    self.account.balance.add_freezed(post_value);
+                }
+            }
+        } else if order.contract_type == ContractType::Futures {
+            // check margin for Perpetual
+            let position = self
+                .account
+                .position
+                .entry((order.symbol.clone(), order.position_side.clone(), order.exchange))
+                .or_insert_with(|| Position {
+                    side: order.position_side.clone(),
+                    exchange: order.exchange,
+                    ..Default::default()
+                });
+
+            // increase leverage, decrease margin
+            match order.side {
+                OrderSide::Sell => {
+                    if position.amount_available < order.amount {
+                        // The corresponding quantity of orders with higher prices,
+                        // such as the original order price of 100, now the order price of 50, the order of 100 needs to be canceled
+                        let mut temp_vec: Vec<_> = self.order_list.inner.iter().cloned().collect();
+                        temp_vec.sort_by(|a, b| {
+                            b.price
+                                .partial_cmp(&a.price)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let mut amount_canceled = 0.0;
+                        for order_inn in temp_vec.iter_mut() {
+                            if order_inn.symbol == order.symbol
+                                && order_inn.position_side == order.position_side
+                                && order_inn.state == OrderState::Open
+                                && order_inn.side == OrderSide::Sell
+                            {
+                                if order_inn.price < order.price {
+                                    break;
+                                }
+                                if amount_canceled + (order_inn.amount - order_inn.filled_amount)
+                                    >= order.amount
+                                {
+                                    self.cancel_order(order_inn.cid.clone());
+                                    order_inn.amount = (order_inn.amount - order_inn.filled_amount)
+                                        + amount_canceled
+                                        - order.amount;
+                                    order_inn.filled_amount = 0.0;
+                                    self.post_order(order_inn.clone());
+                                    self.post_order(order.clone());
+                                    break;
+                                }
+                                amount_canceled += order_inn.amount - order_inn.filled_amount;
+                                self.cancel_order(order_inn.cid.clone());
+                            }
+                        }
+                        return BacktestResponse::bad_request("Insufficient amount, Canceled the amount out of position automatically.".to_string());
+                    }
+                    position.add_freezed(order.amount);
+                    
+                }
+                OrderSide::Buy => {
+                    let margin_value_need = round6(order.amount / order.leverage as f64 * order.price);
+                    if margin_value_need > self.account.balance.get_available() {
+                        return BacktestResponse::bad_request("Insufficient margin.".to_string());
+                    }
+                    if let Some(loss) = order.stop_loss{
+                        if (loss > order.price && order.position_side == PositionSide::Long) || (loss < order.price && order.position_side == PositionSide::Short){
+                            return BacktestResponse::bad_request("Stop loss invailed.".to_string());
+                        }
+                        let mut found = false;
+                        for loss_list in position.stop_loss.iter_mut() {
+                            if loss_list.0 == loss {
+                                loss_list.1 += order.amount;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            position.stop_loss.push((loss, order.amount));
+                        }
+                    }
+                    if let Some(profit) = order.take_profit{
+                        if (profit < order.price && order.position_side == PositionSide::Long) || (profit > order.price && order.position_side == PositionSide::Short){
+                            return BacktestResponse::bad_request("Take profit invailed.".to_string());
+                        }
+                    }
+                    position.leverage = order.leverage;
+                    if margin_value_need > 0.0 {
+                        self.account.balance.add_freezed(margin_value_need);
+                        order.margin = margin_value_need;
+                    }
+                    
+                    
+                }
+            }
+        }
         // update account
         let cid = order.cid.clone();
         // print!("{:?}, {:?}", post_value, amount);
-        if order.side == OrderSide::Buy {
-            self.account.balance.add_freezed(post_value);
-        }
-        else {
-            self.account.position.add_freezed(amount);
-        }
         self.order_list
             .insert_order(self.latency.order_with_latency(order));
-        
 
         BacktestResponse::normal_response(format!("cid: {} order posted.", cid))
     }
@@ -338,15 +624,23 @@ impl ZileanV1 {
     pub fn cancel_order(&mut self, cid: String) -> BacktestResponse {
         // remove order from order_list
         let order = self.order_list.remove_order(cid);
-
         if let Some(mut order) = order {
+            if order.state == OrderState::Filled || order.state == OrderState::Canceled {
+                return BacktestResponse::normal_response("Order already filled or Canceled.".to_string());
+            }
             let mut amount = order.amount - order.filled_amount;
             let value = order.price * amount;
             amount = (amount * 100000.0).round() / 100000.0;
             if order.side == OrderSide::Buy {
-                self.account.balance.sub_freezed(value);
+                self.account
+                .balance
+                .sub_freezed(value / order.leverage as f64);
             } else {
-                self.account.position.sub_freezed(amount);
+                self.account
+                    .position
+                    .entry((order.symbol.clone(), order.position_side.clone(), order.exchange))
+                    .or_default()
+                    .sub_freezed(amount);
             }
             order.state = OrderState::Canceled;
             let cid = order.cid.clone();
@@ -360,22 +654,48 @@ impl ZileanV1 {
         }
     }
 
-    fn match_orders(&mut self, depth: &Depth) {
+    fn match_orders(&mut self) {
+        let depth = &mut self.depth.clone();
         // when tick update, try to match orders
-        let filled_stack = self.order_list.execute_orders(depth, self.fill_model.clone());
+        let filled_stack = self
+            .order_list
+            .execute_orders(depth, self.fill_model.clone());
         if !filled_stack.is_empty() {
             debug!("{:?}", filled_stack);
         }
-
         for filled in filled_stack {
-            // println!("{:?}, {:?}, {:?}, {:?}\n", filled.filled_price, filled.filled_amount, filled.post_price, filled.exchange);
-            self.account
+            let account = self
+                .account
                 .position
-                .update_pos(filled.filled_price, filled.filled_amount);
-            self.account
-                .balance
-                .fill_freezed(filled.filled_price, filled.filled_amount, filled.post_price);
+                .entry((filled.symbol.clone(), filled.side.clone(), filled.exchange))
+                .or_default();
+            self.account.balance.fill_freezed(&filled);
+            account.update_pos(&filled);
+            // take profit
+            if filled.take_profit.is_some()
+                && ((filled.filled_amount > 0.0 && filled.side == PositionSide::Long)
+                    || (filled.filled_amount < 0.0 && filled.side == PositionSide::Short))
+            {
+                let take_profit_order = Order {
+                    cid: format!("tp-{}", filled.cid),
+                    exchange: filled.exchange,
+                    symbol: filled.symbol.clone(),
+                    position_side: filled.side.clone(),
+                    contract_type: filled.contract_type.clone(),
+                    side: OrderSide::Sell,
+                    price: filled.take_profit.unwrap(),
+                    amount: filled.filled_amount.abs(),
+                    leverage: filled.leverage,
+                    timestamp: depth.local_timestamp,
+                    margin: filled.freeze_margin,
+                    state: OrderState::Open,
+                    ..Default::default()
+                };
+                self.post_order(take_profit_order);
+            }
+            
         }
+        // self.account.judege_close((depth.bids[0].0 + depth.asks[0].0) / 2.0, depth.symbol.clone());
     }
 
     // controller for backtest server
@@ -387,16 +707,16 @@ impl ZileanV1 {
 
         //timeout setting
         responder
-            .set_heartbeat_ivl(100) // timeout check interval 1 s
+            .set_heartbeat_ivl(10000) // timeout check interval 100 s
             .expect("Failed to set heartbeat interval");
         responder
-            .set_heartbeat_timeout(300) // timeout check wait time 3 s
+            .set_heartbeat_timeout(30000) // timeout check wait time 300 s
             .expect("Failed to set heartbeat timeout");
         responder
-            .set_heartbeat_ttl(6000) // timeout time 60 s
+            .set_heartbeat_ttl(600000) // timeout time 6000 s
             .expect("Failed to set heartbeat TTL");
         responder
-            .set_rcvtimeo(20000) // receive timeout 10 s
+            .set_rcvtimeo(100000) // receive timeout 100 s
             .expect("Failed to set receive timeout");
         // TODO let dir = url[6..url.len() - 4].to_string() + ".ipc";
         // delete the repete file
@@ -423,16 +743,18 @@ impl ZileanV1 {
             };
             if message.starts_with("TICK") {
                 // execute on_tick and send response
+                responder
+                    .send(self.next_tick.as_str(), 0)
+                    .expect("Failed to send tick data.");
                 let tick = self.on_tick().await;
                 let tick_response =
                     sonic_rs::to_string(&tick).expect("Failed to serialize tick data");
-                responder
-                    .send(tick_response.as_str(), 0)
-                    .expect("Failed to send tick data.");
+                self.next_tick = tick_response;
             } else if let Some(stripped) = message.strip_prefix("POST_ORDER") {
                 let order: Order = match sonic_rs::from_str(stripped) {
                     Ok(order) => order,
                     Err(e) => {
+                        log::error!("Error parsing order: {}", e);
                         let response = sonic_rs::to_string(&BacktestResponse::bad_request(
                             format!("Error parsing order: {}", e),
                         ))
@@ -442,6 +764,11 @@ impl ZileanV1 {
                     }
                 };
                 let response = self.post_order(order);
+                let response = sonic_rs::to_string(&response).unwrap();
+                let _ = responder.send(response.as_str(), 0);
+            } else if let Some(stripped) = message.strip_prefix("CLOSE_POSITION") {
+                let symbol = stripped.to_string();
+                let response = self.cancel_order(symbol);
                 let response = sonic_rs::to_string(&response).unwrap();
                 let _ = responder.send(response.as_str(), 0);
             } else if let Some(stripped) = message.strip_prefix("CANCEL_ORDER") {
@@ -484,6 +811,8 @@ impl ZileanV1 {
 
 #[cfg(test)]
 mod tests {
+    use log::info;
+
     use super::BtConfig;
 
     #[test]
@@ -504,9 +833,8 @@ mod tests {
                 "taker_fee": 0
             }
         }"#;
-        println!("{:?}", config_str);
         let config = BtConfig::parse(config_str);
-        println!("{:?}", config);
+        info!("{:?}", config);
     }
     use super::ZileanV1;
 
