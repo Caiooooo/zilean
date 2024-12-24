@@ -1,5 +1,6 @@
 use crate::engine::*;
 use clickhouse::Row;
+use log::info;
 use serde::ser::Serializer;
 use sonic_rs::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -77,6 +78,8 @@ pub struct Balance {
     total: f64,
     available: f64,
     freezed: f64,
+    // #[serde(skip_serializing)]
+    // maker_fee: f64, // to add when stable in the future
 }
 
 impl Balance {
@@ -100,34 +103,45 @@ impl Balance {
         }
     }
     pub fn fill_freezed_futures(&mut self, filled: &FilledStack) {
+        info!("bal filled: {:?}, before filled: t{}, a{}, f{}", filled, self.total, self.available, self.freezed);
         let amount = filled.filled_amount;
-        let value = (filled.filled_price * filled.filled_amount / filled.leverage as f64 * 1000000.0).round()/1000000.0;
-        let freeze = (filled.post_price * filled.filled_amount / filled.leverage as f64 * 1000000.0).round()/1000000.0;
-        // println!("fill_price: {}, fill_amount: {}, fill_value: {}, freeze_price: {}, freeze_value: {}, lev:{}", filled.filled_price, filled.filled_amount, value, filled.post_price, freeze, filled.leverage);
-        // println!("fill_freezed: price: {}, amount: {}, freeze_price: {}", value, amount, freeze);
+        let value = ((filled.filled_price * filled.filled_amount / filled.leverage as f64) * 1e12).round()/1e12;
+        let freeze = ((filled.post_price * filled.filled_amount / filled.leverage as f64) * 1e12).round()/1e12;
+        let value_open = (filled.open_price.unwrap_or(filled.filled_price) * filled.filled_amount / filled.leverage as f64 * 1e12).round()/1e12;
         if filled.side == PositionSide::Long {
             // open long:amount>0  / close long: amount<0 
-            self.total -= value;
             if amount > 0.0 {
+                // println!("value: {}, freeze: {}, available: {}, lev: {}", value, freeze, self.available, filled.leverage);
+                self.total -= value ;
                 // println!("filled.freeze_mar: {}, amount: {}, amount_tol: {}", filled.freeze_margin, amount, filled.amount_total);
                 // println!("fill:{:?}", filled);
                 // println!("subFreeze,{}", filled.freeze_margin * (amount / filled.amount_total));
                 self.freezed -= freeze;
-                self.available += freeze - value;
+                self.available += freeze - value ;
             } else {
-                self.available -= value;
+                // println!("fill: {}, open: {}, available: {}, lev: {}", filled.filled_price, filled.open_price.unwrap_or(filled.filled_price), self.available, filled.leverage);
+                self.total -= value_open ;
+                self.available -= value_open ;
+                
+                self.total += filled.filled_amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
+                self.available += filled.filled_amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
+                // println!("value: {}, freeze: {}", value * (filled.leverage - 1) as f64, value * filled.leverage as f64);
             }
         } else if filled.side == PositionSide::Short {
             // open short:amount<0  / close short: amount>0 
-            self.total += value;
-            // println!("value: {}, freeze: {}, available: {}", value, freeze, self.available);
             if amount < 0.0 {
+                self.total += value ;
                 self.freezed += freeze;
-                self.available -= freeze - value;
+                self.available -= freeze - value ;
             } else {
-                self.available += value;
+                self.total += value_open ;
+                self.available += value_open ;
+                
+                self.total -= filled.filled_amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
+                self.available -= filled.filled_amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
             }
         }
+        info!("bal filled: {:?}, after filled: t{}, a{}, f{}", filled.cid, self.total, self.available, self.freezed);
         self.round();
         // self.freezed -= filled.freeze_margin * (amount / filled.amount_total);
         // // buy futures, amount > 0, available increase
@@ -151,9 +165,9 @@ impl Balance {
     }
 
     pub fn round(&mut self) {
-        self.freezed = (self.freezed * 10000000.0).round() / 10000000.0;
-        self.available = (self.available * 10000000.0).round() / 10000000.0;
-        self.total = (self.total * 10000000.0).round() / 10000000.0;
+        self.freezed = (self.freezed * 1e12).round() / 1e12;
+        self.available = (self.available * 1e12).round() / 1e12;
+        self.total = (self.total * 1e12).round() / 1e12;
     }
 }
 
@@ -218,6 +232,7 @@ pub struct Position {
 impl Position {
     pub fn update_pos(&mut self, filled : &FilledStack) {
         self.round();
+        info!("filled: {:?}, before filled: t{}, a{}, f{}", filled.cid, self.amount_total, self.amount_available, self.amount_freezed);
         let price = filled.filled_price;
         let amount = filled.filled_amount;
         let old_value = self.amount_total * self.entry_price;
@@ -227,25 +242,33 @@ impl Position {
                 // open long:amount>0 / close long: amount<0
                 self.amount_total += amount;
                 if amount>0.0{ // open long
+                    if self.amount_total == 0.0 {
+                        self.entry_price = 0.0;
+                    } else {
+                        self.entry_price = (old_value + amount.abs() * price) / self.amount_total;
+                    }
                     self.amount_available += amount;
-                }else{ // open long
+                }else{ // close long
                     self.amount_freezed += amount;
                 }
             }else if filled.side == PositionSide::Short {
                 // println!("{:?}", amount);
                 self.amount_total -= amount;
                 if amount<0.0{ // open short
+                    if self.amount_total == 0.0 {
+                        self.entry_price = 0.0;
+                    } else {
+                        self.entry_price = (old_value + amount.abs() * price) / self.amount_total;
+                    }
                     self.amount_available -= amount;
                 }else{ // close short
                     self.amount_freezed -= amount;
                 }
             }
-            
             if self.amount_total == 0.0 {
                 self.entry_price = 0.0;
-            } else {
-                self.entry_price = (old_value + amount.abs() * price) / self.amount_total;
             }
+            
             self.margin_value = self.amount_total * self.entry_price / filled.leverage as f64;
         }else if filled.contract_type == ContractType::Spot {
             self.amount_total += amount;
@@ -261,6 +284,7 @@ impl Position {
                 self.entry_price = (old_value + amount * price) / self.amount_total;
             }
         }
+        info!("pos filled: {:?}, after filled: t{}, a{}, f{}", filled.cid, self.amount_total, self.amount_available, self.amount_freezed);
     }
 
     pub fn add_freezed(&mut self, value: f64) {
@@ -279,9 +303,9 @@ impl Position {
     // }
 
     pub fn round(&mut self) {
-        self.amount_freezed = (self.amount_freezed * 100000.0).round() / 100000.0;
-        self.amount_available = (self.amount_available * 100000.0).round() / 100000.0;
-        self.amount_total = (self.amount_total * 100000.0).round() / 100000.0;
+        self.amount_freezed = (self.amount_freezed * 1e6).round() / 1e6;
+        self.amount_available = (self.amount_available * 1e6).round() / 1e6;
+        self.amount_total = (self.amount_total * 1e6).round() / 1e6;
         if self.entry_price.is_nan() || self.entry_price.is_infinite() {
             self.entry_price = 0.0;
         }
@@ -293,24 +317,26 @@ impl Position {
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Order {
     // for futures
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub contract_type: ContractType,
     #[serde(default)]
     pub position_side: PositionSide,
     // New fields for contract margin mode and leverage
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub margin_mode: MarginMode, // Margin mode: Cross or Isolated
-    #[serde(default = "default_leverage")]
+    #[serde(default = "default_leverage", skip_serializing)]
     pub leverage: u32, // set leverage multiplier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub take_profit: Option<f64>, // Take profit price
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_loss: Option<f64>, // Stop loss price
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub reduce_only: bool, // default false
 
     #[serde(skip_serializing)]
     pub exchange: Exchange,
+    #[serde(skip_serializing)]
+    pub open_price: Option<f64>, // avg_price
     pub cid: String,
     #[serde(skip_serializing)]
     pub symbol: String,
@@ -330,6 +356,7 @@ pub struct Order {
     pub margin: f64,
     #[serde(skip_serializing)]
     pub time_in_force: TimeInForce,
+    #[serde(skip_serializing)]
     pub timestamp: i64,
 }
 fn default_leverage() -> u32 {
@@ -401,8 +428,8 @@ impl Order {
                 
 
         // this is out of most max precision of post, so it won't change the result
-        executed_amount = (executed_amount * 1000000.0).round() / 1000000.0;
-        avg_price = (avg_price * 100000.0).round() / 100000.0;
+        executed_amount = (executed_amount * 1e6).round() / 1e6;
+        avg_price = (avg_price * 1e12).round() / 1e12;
         if avg_price > 0.0 {
             self.avg_price = (avg_price * executed_amount + self.avg_price * self.filled_amount)
                 / (self.filled_amount + executed_amount);
@@ -410,6 +437,7 @@ impl Order {
         self.filled_amount += executed_amount;
 
         if self.filled_amount == self.amount {
+            self.timestamp = depth.local_timestamp;
             self.state = OrderState::Filled;
         } else if self.filled_amount > 0.0 {
             self.state = OrderState::PartiallyFilled;
@@ -499,16 +527,16 @@ impl Order {
         self.front_amount = new_front.min(new_amount).min(0.0);
         // match success on front amount update
         if self.front_amount == 0.0
-            && ((self.side == OrderSide::Buy && (self.price - new_depth.bids[0].0).abs() < 1e-6)
+            && ((self.side == OrderSide::Buy && (self.price - new_depth.bids[0].0).abs() < 1e-11)
                 || (self.side == OrderSide::Sell
-                    && (new_depth.asks[0].0 - self.price).abs() < 1e-6))
+                    && (new_depth.asks[0].0 - self.price).abs() < 1e-11))
         {
             let mut ret = chg;
 
             if chg > self.amount - self.filled_amount {
                 ret = self.amount - self.filled_amount;
             }
-            ret = (ret * 100000.0).round() / 100000.0;
+            ret = (ret * 1e6).round() / 1e6;
             return ret;
         }
         return 0.0;
@@ -551,6 +579,9 @@ where
         "OkexSpot" => Ok(Exchange::OkxSpot),
         "bybit" => Ok(Exchange::BybitSwap),
         "bitget_futures" => Ok(Exchange::BitgetSwap),
+        "binance_swap" => Ok(Exchange::BinanceSwapDec),
+        "bybit_swap" => Ok(Exchange::BybitSwap),
+        "bitget_swap" => Ok(Exchange::BitgetSwap),
         // 更多匹配
         _ => Err(serde::de::Error::custom(format!("Unknown exchange: {}", s))),
     }
@@ -566,4 +597,201 @@ pub struct Trade {
     pub price: f64,           
     pub amount: f64,          
     pub side: String,                 
+}
+
+#[cfg(test)]
+mod tests {
+    use core::panic;
+
+    use super::*;
+    use crate::engine::FillModel;
+
+    #[test]
+    fn test_order_execute() {
+        // Buy Long (917.65 0.035344)
+        // Buy Long (21716.0 0.035311)
+        // Buy Long (102.0 0.035157)
+        // Buy Long (153.0 0.034889)
+        // Sell Long (22888.65 0.034886)
+        let mut order = Order {
+            contract_type: ContractType::Futures,
+            position_side: PositionSide::Long,
+            margin_mode: MarginMode::Cross,
+            leverage: 10,
+            exchange: Exchange::BinanceSwap,
+            open_price: Some(100.0),
+            cid: "test".to_string(),
+            symbol: "btcusdt".to_string(),
+            price: 100.0,
+            amount: 10.0,
+            filled_amount: 0.0,
+            front_amount: -1.0,
+            prev_depth: Depth::default(),
+            avg_price: 0.0,
+            side: OrderSide::Buy,
+            state: OrderState::Open,
+            order_type: OrderType::Limit,
+            margin: 0.0,
+            time_in_force: TimeInForce::Gtc,
+            timestamp: 0,
+            ..Default::default()
+        };
+        let depth = Depth {
+            exchange: Exchange::BinanceSwap,
+            symbol: "btcusdt".to_string(),
+            bids: vec![(100.0, 10.0)],
+            asks: vec![(100.0, 10.0)],
+            timestamp: 0,
+            local_timestamp: 0,
+        };
+        let fill_model = FillModel::None;
+        let (avg_price, executed_amount) = order.execute(&depth, fill_model);
+        assert_eq!(avg_price, 100.0);
+        assert_eq!(executed_amount, 10.0);
+        assert_eq!(order.filled_amount, 10.0);
+        assert_eq!(order.state, OrderState::Filled);
+    }
+
+    #[test]
+    fn test_position_update_pos() {
+        let mut position = Position {
+            side: PositionSide::Long,
+            exchange: Exchange::BinanceSwap,
+            leverage: 10,
+            margin_value: 0.0,
+            amount_total: 0.0,
+            amount_available: 0.0,
+            amount_freezed: 0.0,
+            entry_price: 0.0,
+            stop_loss: vec![(0.0, 0.0)],
+        };
+        let filled = FilledStack {
+            exchange: Exchange::BinanceSwap,
+            symbol: "btcusdt".to_string(),
+            side: PositionSide::Long,
+            contract_type: ContractType::Futures,
+            leverage: 10,
+            filled_price: 100.0,
+            filled_amount: 10.0,
+            post_price: 100.0,
+            open_price: None,
+            ..Default::default()
+        };
+        position.update_pos(&filled);
+        assert_eq!(position.amount_total, 10.0);
+        assert_eq!(position.amount_available, 10.0);
+        assert_eq!(position.entry_price, 100.0);
+        assert_eq!(position.margin_value, 100.0);
+    }
+
+    #[test]
+    fn test_balance_update(){
+        let balance = Balance{
+            total: 100.0,
+            available: 100.0,
+            freezed: 0.0,
+        };
+        let mut account = Account{
+            backtest_id: "test".to_string(),
+            balance,
+            position: HashMap::new(),
+        };
+        // let account = self
+        //     .account
+        //     .position
+        //     .entry((filled.symbol.clone(), filled.side.clone(), filled.exchange))
+        //     .or_default();
+        // self.account.balance.fill_freezed(&filled);
+        // account.update_pos(&filled);
+
+        // Buy Long (917.65 0.035344)
+        // Buy Long (21716.0 0.035311)
+        // Buy Long (102.0 0.035157)
+        // Buy Long (153.0 0.034889)
+        // Sell Long (22888.65 0.034886)
+        let buy1 = FilledStack {
+            symbol: "btcusdt".to_string(),
+            side: PositionSide::Long,
+            contract_type: ContractType::Futures,
+            leverage: 10,
+            filled_price: 0.035344,
+            filled_amount: 917.65,
+            post_price: 0.035344,
+            open_price: Some(0.035344),
+            ..Default::default()
+        };
+
+        let buy2 = FilledStack {
+            exchange: Exchange::BinanceSwap,
+            symbol: "btcusdt".to_string(),
+            side: PositionSide::Long,
+            contract_type: ContractType::Futures,
+            leverage: 10,
+            filled_price: 0.035311,
+            filled_amount: 21716.0,
+            post_price: 0.035311,
+            open_price: Some(0.035311),
+            ..Default::default()
+        };
+
+        let buy3 = FilledStack {
+            exchange: Exchange::BinanceSwap,
+            symbol: "btcusdt".to_string(),
+            side: PositionSide::Long,
+            contract_type: ContractType::Futures,
+            leverage: 10,
+            filled_price: 0.035157,
+            filled_amount: 102.0,
+            post_price: 0.035157,
+            open_price: Some(0.035157),
+            ..Default::default()
+        };
+
+        let buy4 = FilledStack {
+            exchange: Exchange::BinanceSwap,
+            symbol: "btcusdt".to_string(),
+            side: PositionSide::Long,
+            contract_type: ContractType::Futures,
+            leverage: 10,
+            filled_price: 0.034889,
+            filled_amount: 153.0,
+            post_price: 0.034889,
+            open_price: Some(0.034889),
+            ..Default::default()
+        };
+
+        let sell = FilledStack {
+            exchange: Exchange::BinanceSwap,
+            symbol: "btcusdt".to_string(),
+            side: PositionSide::Long,
+            contract_type: ContractType::Futures,
+            leverage: 10,
+            filled_price: 0.034886,
+            filled_amount: -22888.65,
+            post_price: 0.034886,
+            open_price: Some(0.035344),
+            ..Default::default()
+        };
+
+        account.balance.fill_freezed_futures(&buy1);
+        // println!("{:?}", balance);
+        account.balance.fill_freezed_futures(&buy2);
+        account.balance.fill_freezed_futures(&buy3);
+        account.balance.fill_freezed_futures(&buy4);
+        account.balance.fill_freezed_futures(&sell);
+        // println!("{:?}", balance);
+
+        let pos =  account
+            .position
+            .entry(("btcusdt".to_string(), PositionSide::Long, Exchange::BinanceSwap))
+            .or_default();
+        pos.update_pos(&buy1);
+        pos.update_pos(&buy2);
+        pos.update_pos(&buy3);
+        pos.update_pos(&buy4);
+        pos.update_pos(&sell);
+        // println!("{:?}", pos);
+        println!("{:?}", account);
+        panic!();
+    }
 }

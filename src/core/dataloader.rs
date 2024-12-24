@@ -15,7 +15,6 @@ pub enum DataSource {
 pub struct DatabaseAccount {
     pub host: String,
     pub port: u16,
-    pub database: String,
     pub username: String,
     pub password: String,
 }
@@ -26,7 +25,8 @@ pub struct DataLoader {
     database: Option<DatabaseAccount>,
     source: DataSource,
     limit: usize,
-    limit_ratio: f32,
+    limit_ratio_depth: f32,
+    limit_ratio_trade: f32,
     last_timestamp_depth: usize,
     last_timestamp_trade: usize,
 }
@@ -66,7 +66,7 @@ impl DataLoader {
                 .with_password(conf.password);
             for exchange in &exchange_list{
                 let query = format!(
-                    "SELECT  ?fields FROM {}.orderbook_{} LIMIT 1",
+                    "SELECT  ?fields FROM {}.orderbook_{} ORDER BY local_timestamp LIMIT 1",
                     exchange,
                     &config.symbol.replace("_", "").to_lowercase()
                 );
@@ -84,7 +84,7 @@ impl DataLoader {
                 }
 
                 let query_trade = format!(
-                    "SELECT  ?fields FROM {}.trade_{} LIMIT 1",
+                    "SELECT  ?fields FROM {}.trade_{} ORDER BY local_timestamp LIMIT 1",
                     exchange,
                     &config.symbol.replace("_", "").to_lowercase()
                 );
@@ -109,7 +109,8 @@ impl DataLoader {
             database,
             source,
             limit,
-            limit_ratio: 100.0,
+            limit_ratio_depth: 100.0,
+            limit_ratio_trade: 100.0,
             last_timestamp_trade: start_time as usize,
             last_timestamp_depth: start_time as usize,
         }
@@ -133,8 +134,7 @@ impl DataLoader {
         let client = Client::default()
             .with_url(format!("{}:{}", dbconf.host, dbconf.port))
             .with_user(dbconf.username)
-            .with_password(dbconf.password)
-            .with_database(dbconf.database);
+            .with_password(dbconf.password);
 
         let exchange_list: Vec<String> = self
             .config
@@ -159,7 +159,7 @@ impl DataLoader {
                 "invalid end time, end time should be grater than 0.",
             ));
         }
-        let end_time = (self.last_timestamp_trade + self.limit * self.limit_ratio as usize)
+        let end_time = (self.last_timestamp_trade + self.limit * self.limit_ratio_trade as usize)
             .min(self.config.end_time as usize);
 
         let mut query = String::from("WITH filtered_data AS (");
@@ -183,7 +183,7 @@ impl DataLoader {
                 debug!("query success");
                 if !data.is_empty() {
                     if data.len() < self.limit {
-                        self.limit_ratio *= (self.limit as f32 / data.len() as f32).min(20.0);
+                        self.limit_ratio_trade *= (self.limit as f32 / data.len() as f32).min(20.0);
                         // slow start
                     }
                     self.last_timestamp_trade = end_time + 1;
@@ -237,7 +237,7 @@ impl DataLoader {
                 "invalid end time, end time should be grater than 0.",
             ));
         }
-        let end_time = (self.last_timestamp_depth + self.limit * self.limit_ratio as usize)
+        let end_time = (self.last_timestamp_depth + self.limit * self.limit_ratio_depth as usize)
             .min(self.config.end_time as usize);
 
         let mut query = String::from("WITH filtered_data AS (");
@@ -264,7 +264,7 @@ impl DataLoader {
                 debug!("query success");
                 if !data.is_empty() {
                     if data.len() < self.limit {
-                        self.limit_ratio *= (self.limit as f32 / data.len() as f32).min(20.0);
+                        self.limit_ratio_depth *= (self.limit as f32 / data.len() as f32).min(20.0);
                         // slow start
                     }
                     self.last_timestamp_depth = end_time  + 1;
@@ -279,7 +279,7 @@ impl DataLoader {
                 Ok(data)
             }
             Err(e) => {
-                error!("query failed: {:?}", e);
+                error!("query {} failed: {:?}", query,  e);
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     e,
