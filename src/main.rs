@@ -5,7 +5,9 @@ use server::{BacktestResponse, ZileanServer};
 use zilean::*;
 use zmq::Context;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 96)]
+
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 192)] // num_cpus::get()
 async fn main() {
     init_logger();
     let zconfig = ZConfig::parse("./config.toml");

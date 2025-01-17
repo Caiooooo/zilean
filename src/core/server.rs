@@ -10,7 +10,7 @@ pub struct ZileanServer {
     // backtests: Arc<Mutex<FxHashMap<String, ZileanV1>>>,
 }
 
-#[tokio::main]
+// #[tokio::main]
 async fn start_zilean(bid_clone:String, config: BtConfig, tick_url: String){
     let mut zilean = ZileanV1::new(config).await;
     zilean.launch(bid_clone.clone(), &tick_url).await.unwrap();
@@ -28,7 +28,7 @@ impl ZileanServer {
         let bid_clone = backtest_id.clone();
         // let bt_clone = Arc::clone(&self.backtests);
         tokio::spawn(async move {
-            start_zilean(bid_clone, config, tick_url);
+            start_zilean(bid_clone, config, tick_url).await;
         });
 
         backtest_id

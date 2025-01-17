@@ -10,7 +10,7 @@ use sonic_rs::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use zmq::Context;
+
 
 #[derive(Debug, Default, PartialEq)]
 pub enum BacktestState {
@@ -144,9 +144,16 @@ impl OrderList {
         let mut filled = vec![];
         self.inner.retain_mut(|order| {
             if order.state == OrderState::Canceled || order.state == OrderState::Filled {
+                let threshold:i64 = 9_999_999_999_999_999; // microsecond
+                let mut order_time = order.timestamp;
+                let mut depth_time = depth.local_timestamp;
+                if order_time > threshold { // nanosecond
+                    order_time /= 1_000_000;
+                    depth_time /= 1_000_000;
+                }
                 // keep this order for seconds after it is filled or canceled, then remove it in case of latency
                 //  magic number: 3_000_000 mean 3 s
-                if order.timestamp + 3_100_000 < depth.local_timestamp {
+                if order_time + 3_100 < depth_time {
                     return false;
                 }
                 return true;
@@ -215,14 +222,14 @@ pub struct TickResponseTrade {
 
 // v1, do not support hedge backtest
 pub struct ZileanV1 {
-    config: BtConfig,
+    pub config: BtConfig,
     // trade: Trade,
     order_list: OrderList,
-    account: Account,
+    pub account: Account,
     data_loader: Arc<Mutex<DataLoader>>,
     data_cache: VecDeque<Depth>,
     trade_cache: VecDeque<Trade>,
-    next_tick: String,
+    pub next_tick: String,
     latency: LatencyModel,
     fill_model: FillModel,
     state: BacktestState,
@@ -236,7 +243,7 @@ impl ZileanV1 {
             // trade: Trade::default(),
             order_list: OrderList::default(),
             account: Account::default(),
-            data_loader: Arc::new(Mutex::new(DataLoader::new(100_000, &config).await)),
+            data_loader: Arc::new(Mutex::new(DataLoader::new(50_000, &config).await)),
             data_cache: VecDeque::new(),
             trade_cache: VecDeque::new(),
             latency: LatencyModel::Fixed(20),
@@ -709,6 +716,7 @@ impl ZileanV1 {
                 .or_default();
             self.account.balance.fill_freezed(&filled);
             account.update_pos(&filled);
+            info!("current orders: {:?}", self.order_list.inner);
             // take profit
             if filled.take_profit.is_some()
                 && ((filled.filled_amount > 0.0 && filled.side == PositionSide::Long)
@@ -735,108 +743,8 @@ impl ZileanV1 {
         // self.account.judege_close((depth.bids[0].0 + depth.asks[0].0) / 2.0, depth.symbol.clone());
     }
 
-    // controller for backtest server
-    async fn start_listening(&mut self, tick_url: &str) {
-        // start zmq server here, listen on ipc:///tmp/zilean_backtest/{backtest_id}.ipc
-        let context = Context::new();
-        let responder = context.socket(zmq::REP).unwrap();
-        let url = format!("{}{}.ipc", tick_url, self.account.backtest_id);
-
-        //timeout setting
-        responder
-            .set_heartbeat_ivl(10000) // timeout check interval 100 s
-            .expect("Failed to set heartbeat interval");
-        responder
-            .set_heartbeat_timeout(30000) // timeout check wait time 300 s
-            .expect("Failed to set heartbeat timeout");
-        responder
-            .set_heartbeat_ttl(600000) // timeout time 6000 s
-            .expect("Failed to set heartbeat TTL");
-        responder
-            .set_rcvtimeo(100000) // receive timeout 100 s
-            .expect("Failed to set receive timeout");
-        // TODO let dir = url[6..url.len() - 4].to_string() + ".ipc";
-        // delete the repete file
-
-        responder.bind(&url).expect("Failed to bind socket");
-        info!("bt-server {} connected.", self.account.backtest_id);
-        loop {
-            let message = match responder.recv_string(0) {
-                Ok(msg) => msg.unwrap(),
-                Err(e) => {
-                    // connection interrupted
-                    if e.to_string().contains("Resource temporarily unavailable") {
-                        info!("Connection {} recv timeout.", self.account.backtest_id);
-                        break;
-                    }
-                    let response = sonic_rs::to_string(&BacktestResponse::bad_request(format!(
-                        "Error prasing string, {}.",
-                        e
-                    )))
-                    .unwrap();
-                    let _ = responder.send(response.as_str(), 0);
-                    continue;
-                }
-            };
-            if message.starts_with("TICK") {
-                // execute on_tick and send response
-                responder
-                    .send(self.next_tick.as_str(), 0)
-                    .expect("Failed to send tick data.");
-                let tick = self.on_tick().await;
-                let tick_response =
-                    sonic_rs::to_string(&tick).expect("Failed to serialize tick data");
-                self.next_tick = tick_response;
-            } else if let Some(stripped) = message.strip_prefix("POST_ORDER") {
-                let order: Order = match sonic_rs::from_str(stripped) {
-                    Ok(order) => order,
-                    Err(e) => {
-                        log::error!("Error parsing order: {}", e);
-                        let response = sonic_rs::to_string(&BacktestResponse::bad_request(
-                            format!("Error parsing order: {}", e),
-                        ))
-                        .unwrap();
-                        let _ = responder.send(response.as_str(), 0);
-                        continue;
-                    }
-                };
-                let response = self.post_order(order);
-                let response = sonic_rs::to_string(&response).unwrap();
-                let _ = responder.send(response.as_str(), 0);
-            } else if let Some(stripped) = message.strip_prefix("CLOSE_POSITION") {
-                let symbol = stripped.to_string();
-                let response = self.cancel_order(symbol);
-                let response = sonic_rs::to_string(&response).unwrap();
-                let _ = responder.send(response.as_str(), 0);
-            } else if let Some(stripped) = message.strip_prefix("CANCEL_ORDER") {
-                let cid = stripped.to_string();
-                let response = self.cancel_order(cid);
-                let response = sonic_rs::to_string(&response).unwrap();
-                let _ = responder.send(response.as_str(), 0);
-            } else if message.starts_with("CLOSE") {
-                info!("Server closed.");
-                let response = sonic_rs::to_string(&BacktestResponse::normal_response(
-                    "Server closed.".to_string(),
-                ))
-                .unwrap();
-                responder
-                    .send(response.as_str(), 0)
-                    .expect("Failed to send unknown command response.");
-                break;
-            } else {
-                let response = sonic_rs::to_string(&BacktestResponse::bad_request(
-                    "Unknown command.".to_string(),
-                ))
-                .unwrap();
-                responder
-                    .send(response.as_str(), 0)
-                    .expect("Failed to send unknown command response.");
-            }
-        }
-        self.close_bt(responder, tick_url).await;
-    }
-
-    async fn close_bt(&mut self, responder: zmq::Socket, tick_url: &str) {
+    
+    pub async fn close_bt(&mut self, responder: zmq::Socket, tick_url: &str) {
         info!(
             "Closing backtest server for id: {}.",
             self.account.backtest_id
