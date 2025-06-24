@@ -11,11 +11,10 @@ pub enum Exchange {
     BinanceSpot,
     CoinbaseSpot,
     OkxSpot,
+    OkxSwap,
     KrakenSpot,
     BinanceSwap,
     BybitSwap,
-    BinanceSwapDec,
-    BinanceSwapInc,
     BitgetSwap,
 }
 
@@ -571,6 +570,7 @@ where
         "kraken" => Ok(Exchange::KrakenSpot),
         "okx" => Ok(Exchange::OkxSpot),
         "okex" => Ok(Exchange::OkxSpot),
+        "okx_futures" => Ok(Exchange::OkxSwap),
         "binance-futures" => Ok(Exchange::BinanceSwap),
         "BinanceSpot" => Ok(Exchange::BinanceSpot),
         "CoinbaseSpot" => Ok(Exchange::CoinbaseSpot),
@@ -579,7 +579,6 @@ where
         "OkexSpot" => Ok(Exchange::OkxSpot),
         "bybit" => Ok(Exchange::BybitSwap),
         "bitget_futures" => Ok(Exchange::BitgetSwap),
-        "binance_swap" => Ok(Exchange::BinanceSwapDec),
         "bybit_swap" => Ok(Exchange::BybitSwap),
         "bitget_swap" => Ok(Exchange::BitgetSwap),
         // 更多匹配

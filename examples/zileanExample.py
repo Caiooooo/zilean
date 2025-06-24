@@ -18,7 +18,7 @@ def main():
     socket_server.connect("ipc:///tmp/zilean_backtest.ipc")
 
     message = {
-        "exchanges": ["BinanceSpot"],
+        "exchanges": ["OkxSwap"],
         "symbol": "BTC_USDT",
         "start_time": 0,
         "end_time": 1727930047114,
@@ -32,7 +32,7 @@ def main():
     print(data)
 
     if data.get('status') == 'ok':
-        backtest_id = data.get('backtest_id')
+        backtest_id = data.get('message')
         print('backtest_id:', backtest_id)
 
         socket_bt = context.socket(zmq.REQ)
@@ -42,17 +42,15 @@ def main():
         start_time = time.time()  # 记录开始时间
 
         while True:
-            request = f'TICK{backtest_id}'.encode('utf-8')
+            request = f'TICK'.encode('utf-8')
             response = send_and_receive(socket_bt, request)
 
             # 处理响应
-            if cnt % 10000 == 0:
-                print(f"{cnt} {response['status']} {response['message'][13:20]}")
+            if cnt % 1000 == 0:
+                print(f"{cnt} {response['message']}")
             cnt += 1
 
-            if response.get('status') != 'ok':
-                print('Backtest error')  # 可能是数据结束
-                break
+            print(response)
 
         elapsed_time = time.time() - start_time
         print(f"程序运行时间: {elapsed_time} 秒")

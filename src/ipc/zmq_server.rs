@@ -27,6 +27,14 @@ impl ZileanV1{
         // TODO let dir = url[6..url.len() - 4].to_string() + ".ipc";
         // delete the repete file
 
+        // 检查并创建目录
+        if let Some(dir_path) = url.strip_prefix("ipc://") {
+            if let Some(parent_dir) = std::path::Path::new(dir_path).parent() {
+                if !parent_dir.exists() {
+                    std::fs::create_dir_all(parent_dir).expect("Failed to create directory");
+                }
+            }
+        }
         responder.bind(&url).expect("Failed to bind socket");
         info!("bt-server {} connected.", self.account.backtest_id);
         loop {

@@ -3,6 +3,8 @@ use serde::Serialize;
 // use rustc_hash::FxHashMap;
 // use std::sync::{Arc, Mutex};
 
+use crate::ZConfig;
+
 use super::engine::{BtConfig, ZileanV1};
 
 #[derive(Default)]
@@ -11,9 +13,10 @@ pub struct ZileanServer {
 }
 
 // #[tokio::main]
-async fn start_zilean(bid_clone:String, config: BtConfig, tick_url: String){
-    let mut zilean = ZileanV1::new(config).await;
-    zilean.launch(bid_clone.clone(), &tick_url).await.unwrap();
+async fn start_zilean(bid_clone:String, config: BtConfig, zconfig: ZConfig){
+    let url = zconfig.tick_url.clone();
+    let mut zilean = ZileanV1::new(config, zconfig).await;
+    zilean.launch(bid_clone.clone(), &url).await.unwrap();
 }
 
 impl ZileanServer {
@@ -23,12 +26,12 @@ impl ZileanServer {
         }
     }
 
-    pub async fn launch_backtest(&mut self, config: BtConfig, tick_url: String) -> String {
+    pub async fn launch_backtest(&mut self, config: BtConfig, zconfig: ZConfig) -> String {
         let backtest_id = format!("bt-{}", nanoid::nanoid!());
         let bid_clone = backtest_id.clone();
         // let bt_clone = Arc::clone(&self.backtests);
         tokio::spawn(async move {
-            start_zilean(bid_clone, config, tick_url).await;
+            start_zilean(bid_clone, config, zconfig).await;
         });
 
         backtest_id

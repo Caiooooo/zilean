@@ -56,6 +56,14 @@ message = {
 }
 ```
 
+### Quick Start
+1. Install [Clickhouse](https://clickhouse.com/docs/zh/install)  
+2. ```vim /etc/clickhouse-server/users.d/default-password.xml ``` 
+and set your own passwd in misc/config.toml and examples/insert.py. eg ```<clickhouse><users><default><password>RyQplVJetI2M</password></default> </users></clickhouse>```  
+3. insert the sample data in order_btc_spot_okx_2024_10_07.parquet using ```python3 example/insert.py.```
+4. ```cargo r -r```
+5. open a new termial ```python3 example/zileanExample.py```
+
 ### Monitoring Backtest Performance
 After launching the backtest, you can monitor its progress by sending requests to get ticks or account information. This is done through ZeroMQ REQ/REP or PUB/SUB for real-time updates.
 

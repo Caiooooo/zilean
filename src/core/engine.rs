@@ -1,5 +1,5 @@
 use crate::dataloader::DataSource;
-use crate::market::*;
+use crate::{market::*, ZConfig};
 use crate::round::round6;
 use rand::Rng;
 // use rustc_hash::FxHashMap;
@@ -237,13 +237,13 @@ pub struct ZileanV1 {
 }
 
 impl ZileanV1 {
-    pub async fn new(config: BtConfig) -> ZileanV1 {
+    pub async fn new(config: BtConfig, zconfig: ZConfig) -> ZileanV1 {
         Self {
             config: config.clone(),
             // trade: Trade::default(),
             order_list: OrderList::default(),
             account: Account::default(),
-            data_loader: Arc::new(Mutex::new(DataLoader::new(50_000, &config).await)),
+            data_loader: Arc::new(Mutex::new(DataLoader::new(50_000, &config, zconfig).await)),
             data_cache: VecDeque::new(),
             trade_cache: VecDeque::new(),
             latency: LatencyModel::Fixed(20),
@@ -786,7 +786,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_tick() {
-        let mut zilean = ZileanV1::new(BtConfig::default()).await;
+        let zconfig = crate::ZConfig::parse("misc/config.toml");
+        let mut zilean = ZileanV1::new(BtConfig::default(), zconfig).await;
         println!("{:?}", BtConfig::default());
         zilean.state = super::BacktestState::Running;
         zilean.prepare_data().await.unwrap();

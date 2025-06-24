@@ -2,10 +2,11 @@ use sonic_rs::{Deserialize, Serialize};
 
 use crate::dataloader::DatabaseAccount;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ZConfig {
     pub start_url: String,
     pub tick_url: String,
+    pub use_trade: bool,
     pub debug: bool,
     pub database: DatabaseAccount,
 }
@@ -16,6 +17,7 @@ impl ZConfig {
         toml::de::from_str(&s).unwrap()
     }
 }
+
 
 #[cfg(test)]
 mod test {

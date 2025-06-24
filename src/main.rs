@@ -10,7 +10,7 @@ use zmq::Context;
 #[tokio::main(flavor = "multi_thread", worker_threads = 192)] // num_cpus::get()
 async fn main() {
     init_logger();
-    let zconfig = ZConfig::parse("./config.toml");
+    let zconfig = ZConfig::parse("./misc/config.toml");
     let mut zilean_server = ZileanServer::new();
     let context = Context::new();
     let responder = context.socket(zmq::REP).unwrap();
@@ -59,7 +59,7 @@ async fn main() {
                 }
             };
             let backtest_id = zilean_server
-                .launch_backtest(bt_config, zconfig.tick_url.clone())
+                .launch_backtest(bt_config, zconfig.clone())
                 .await;
             let response =
                 sonic_rs::to_string(&BacktestResponse::normal_response(backtest_id)).unwrap();
