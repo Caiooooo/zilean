@@ -8,6 +8,7 @@ use log::{debug, info};
 use rand_distr::{Distribution, Normal};
 use sonic_rs::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::i64;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -223,6 +224,7 @@ pub struct TickResponseTrade {
 // v1, do not support hedge backtest
 pub struct ZileanV1 {
     pub config: BtConfig,
+    pub zconfig: ZConfig,
     // trade: Trade,
     order_list: OrderList,
     pub account: Account,
@@ -240,6 +242,7 @@ impl ZileanV1 {
     pub async fn new(config: BtConfig, zconfig: ZConfig) -> ZileanV1 {
         Self {
             config: config.clone(),
+            zconfig: zconfig.clone(),
             // trade: Trade::default(),
             order_list: OrderList::default(),
             account: Account::default(),
@@ -312,7 +315,7 @@ impl ZileanV1 {
                 return BacktestResponse::bad_request("No more data, backtestfinished".to_string());
             }
         }
-        if self.trade_cache.is_empty() {
+        if self.trade_cache.is_empty() && self.zconfig.use_trade{
             let data_loader = self.data_loader.clone();
             // fill the cache with new data
             let handle = tokio::spawn(async move { data_loader.lock().await.load_trade().await });
@@ -337,13 +340,16 @@ impl ZileanV1 {
         let is_trade = matches!(
             self.trade_cache
                 .front()
-                .unwrap()
+                .unwrap_or(&Trade{
+                    local_timestamp: i64::MAX,
+                    ..Default::default()
+                })
                 .local_timestamp
                 .cmp(&self.data_cache.front().unwrap().local_timestamp),
             std::cmp::Ordering::Less
         );
         if is_trade {
-            let trade = self.trade_cache.pop_front().unwrap();
+            let trade = self.trade_cache.pop_front().unwrap_or_default();
             let tick_response = TickResponseTrade {
                 trade,
                 account: self.account.clone(),

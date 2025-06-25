@@ -21,7 +21,7 @@ def main():
         "exchanges": ["OkxSwap"],
         "symbol": "BTC_USDT",
         "start_time": 0,
-        "end_time": 1727930047114,
+        "end_time": 17279300471140000,
         "balance": {"total": 0, "available": 0, "freezed": 0},
         "source": "Database",
         "fee_rate": {"maker_fee": 0, "taker_fee": 0},
@@ -46,7 +46,7 @@ def main():
             response = send_and_receive(socket_bt, request)
 
             # 处理响应
-            if cnt % 1000 == 0:
+            if cnt % 100 == 0:
                 print(f"{cnt} {response['message']}")
             cnt += 1
 
