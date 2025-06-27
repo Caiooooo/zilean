@@ -1,5 +1,5 @@
 use crate::dataloader::DataSource;
-use crate::market::*;
+use crate::{market::*, ZConfig};
 use crate::round::round6;
 use rand::Rng;
 // use rustc_hash::FxHashMap;
@@ -8,6 +8,7 @@ use log::{debug, info};
 use rand_distr::{Distribution, Normal};
 use sonic_rs::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::i64;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -200,6 +201,7 @@ pub struct FilledStack {
     pub stop_loss: Option<f64>,
     pub open_price: Option<f64>,
     pub filled_price: f64,
+    
     pub filled_amount: f64,
     pub post_price: f64,
     pub freeze_margin: f64,
@@ -223,6 +225,7 @@ pub struct TickResponseTrade {
 // v1, do not support hedge backtest
 pub struct ZileanV1 {
     pub config: BtConfig,
+    pub zconfig: ZConfig,
     // trade: Trade,
     order_list: OrderList,
     pub account: Account,
@@ -237,13 +240,14 @@ pub struct ZileanV1 {
 }
 
 impl ZileanV1 {
-    pub async fn new(config: BtConfig) -> ZileanV1 {
+    pub async fn new(config: BtConfig, zconfig: ZConfig) -> ZileanV1 {
         Self {
             config: config.clone(),
+            zconfig: zconfig.clone(),
             // trade: Trade::default(),
             order_list: OrderList::default(),
             account: Account::default(),
-            data_loader: Arc::new(Mutex::new(DataLoader::new(50_000, &config).await)),
+            data_loader: Arc::new(Mutex::new(DataLoader::new(50_000, &config, zconfig).await)),
             data_cache: VecDeque::new(),
             trade_cache: VecDeque::new(),
             latency: LatencyModel::Fixed(20),
@@ -259,9 +263,9 @@ impl ZileanV1 {
         backtest_id: String,
         tick_url: &str,
     ) -> Result<(), std::io::Error> {
-        self.prepare_data().await?;
-        self.account.backtest_id = backtest_id;
         self.account.balance = self.config.balance.clone();
+        self.account.backtest_id = backtest_id;
+        self.prepare_data().await?;
         // self.account.position.symbol = self.config.symbol.clone().split("_").next().unwrap().to_string();
         self.start_listening(tick_url).await;
         Ok(())
@@ -312,7 +316,7 @@ impl ZileanV1 {
                 return BacktestResponse::bad_request("No more data, backtestfinished".to_string());
             }
         }
-        if self.trade_cache.is_empty() {
+        if self.trade_cache.is_empty() && self.zconfig.use_trade{
             let data_loader = self.data_loader.clone();
             // fill the cache with new data
             let handle = tokio::spawn(async move { data_loader.lock().await.load_trade().await });
@@ -337,13 +341,16 @@ impl ZileanV1 {
         let is_trade = matches!(
             self.trade_cache
                 .front()
-                .unwrap()
+                .unwrap_or(&Trade{
+                    local_timestamp: i64::MAX,
+                    ..Default::default()
+                })
                 .local_timestamp
                 .cmp(&self.data_cache.front().unwrap().local_timestamp),
             std::cmp::Ordering::Less
         );
         if is_trade {
-            let trade = self.trade_cache.pop_front().unwrap();
+            let trade = self.trade_cache.pop_front().unwrap_or_default();
             let tick_response = TickResponseTrade {
                 trade,
                 account: self.account.clone(),
@@ -351,6 +358,9 @@ impl ZileanV1 {
             };
             self.match_orders();
             return BacktestResponse::normal_response(sonic_rs::to_string(&tick_response).unwrap());
+        }
+        if !self.zconfig.use_trade{
+            self.match_orders();
         }
         let mut depth = self.data_cache.pop_front().unwrap();
         for ask in depth.asks.iter_mut() {
@@ -462,43 +472,45 @@ impl ZileanV1 {
         }
 
         // Force close all remaining positions with market price if necessary
-        for position_side in &[PositionSide::Long, PositionSide::Short] {
-            if let Some(position) = self.account.position.get_mut(&(
-                depth.symbol.clone(),
-                position_side.clone(),
-                depth.exchange,
-            )) {
-                let margin_need = (position.entry_price - depth.asks[0].0) * position.amount_total;
-                if (position_side == &PositionSide::Short && margin_need < 0.0
-                    || position_side == &PositionSide::Long && margin_need > 0.0)
-                    && position.margin_value - margin_need.abs() < 0.0
-                {
-                    let fc_price = (depth.asks[0].0 + depth.bids[0].0) / 2.0;
-                    let force_close_order = Order {
-                        contract_type: ContractType::Futures,
-                        symbol: depth.symbol.clone(),
-                        exchange: depth.exchange,
-                        order_type: OrderType::Market,
-                        position_side: position_side.clone(),
-                        leverage: position.leverage,
-                        cid: "fc-".to_string() + depth.symbol.clone().as_str(),
-                        price: fc_price,
-                        amount: position.amount_total,
-                        side: OrderSide::Sell,
-                        timestamp: 0,
-                        ..Default::default()
-                    };
-                    close_list.push(force_close_order);
-                    position.amount_total = 0.0; // Ensure the total is reset
-                    position.stop_loss.clear(); // Clear stop-loss
-                }
-            }
-        }
 
-        // Process all close orders
-        for order in close_list {
-            self.post_order(order);
-        }
+        // todo: force close, error in spot
+        // for position_side in &[PositionSide::Long, PositionSide::Short] {
+        //     if let Some(position) = self.account.position.get_mut(&(
+        //         depth.symbol.clone(),
+        //         position_side.clone(),
+        //         depth.exchange,
+        //     )) {
+        //         let margin_need = (position.entry_price - depth.asks[0].0) * position.amount_total;
+        //         if (position_side == &PositionSide::Short && margin_need < 0.0
+        //             || position_side == &PositionSide::Long && margin_need > 0.0)
+        //             && position.margin_value - margin_need.abs() < 0.0
+        //         {
+        //             let fc_price = (depth.asks[0].0 + depth.bids[0].0) / 2.0;
+        //             let force_close_order = Order {
+        //                 contract_type: ContractType::Futures,
+        //                 symbol: depth.symbol.clone(),
+        //                 exchange: depth.exchange,
+        //                 order_type: OrderType::Market,
+        //                 position_side: position_side.clone(),
+        //                 leverage: position.leverage,
+        //                 cid: "fc-".to_string() + depth.symbol.clone().as_str(),
+        //                 price: fc_price,
+        //                 amount: position.amount_total,
+        //                 side: OrderSide::Sell,
+        //                 timestamp: 0,
+        //                 ..Default::default()
+        //             };
+        //             close_list.push(force_close_order);
+        //             position.amount_total = 0.0; // Ensure the total is reset
+        //             position.stop_loss.clear(); // Clear stop-loss
+        //         }
+        //     }
+        // }
+
+        // // Process all close orders
+        // for order in close_list {
+        //     self.post_order(order);
+        // }
     }
 
     // return cid when success
@@ -708,7 +720,6 @@ impl ZileanV1 {
             debug!("{:?}", filled_stack);
         }
         for filled in filled_stack {
-            // info!("{:?}", filled);
             let account = self
                 .account
                 .position
@@ -786,7 +797,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_tick() {
-        let mut zilean = ZileanV1::new(BtConfig::default()).await;
+        let zconfig = crate::ZConfig::parse("misc/config.toml");
+        let mut zilean = ZileanV1::new(BtConfig::default(), zconfig).await;
         println!("{:?}", BtConfig::default());
         zilean.state = super::BacktestState::Running;
         zilean.prepare_data().await.unwrap();

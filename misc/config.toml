@@ -1,11 +1,11 @@
-start_url = "ipc:///tmp/zilean_backtest_dev.ipc"
+start_url = "ipc:///tmp/zilean_backtest.ipc"
 tick_url = "ipc:///tmp/zilean_backtest/"
+use_trade = false
 debug = false
 
 [database]
 host = "http://localhost"
 port = 8123
-database = "binance"
 username = "default"
 password = "RyQplVJetI2M"
 

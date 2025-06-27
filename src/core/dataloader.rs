@@ -1,6 +1,6 @@
-use crate::config;
 use crate::engine::*;
 use crate::market::*;
+use crate::ZConfig;
 use clickhouse::Client;
 use log::{debug, error};
 use sonic_rs::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ pub enum DataSource {
     Database,
     FilePath(String),
 }
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DatabaseAccount {
     pub host: String,
     pub port: u16,
@@ -32,14 +32,14 @@ pub struct DataLoader {
 }
 
 impl DataLoader {
-    pub async fn new(limit: usize, config: &BtConfig) -> DataLoader {
+    pub async fn new(limit: usize, config: &BtConfig, zconfig: ZConfig) -> DataLoader {
         let config_clone = config.clone();
         let source = match config.source.clone() {
             Some(source) => source,
             _ => DataSource::Database,
         };
         let database = match source {
-            DataSource::Database => Some(config::ZConfig::parse("config.toml").database),
+            DataSource::Database => Some(zconfig.database),
             _ => None,
         };
         // init the start time
@@ -52,11 +52,10 @@ impl DataLoader {
                 Exchange::CoinbaseSpot => "coinbase".to_string(),
                 Exchange::OkxSpot => "okx".to_string(),
                 Exchange::KrakenSpot => "kraken".to_string(),
+                Exchange::OkxSwap => "okx_futures".to_string(),
                 Exchange::BinanceSwap => "binance_futures".to_string(),
                 Exchange::BybitSwap => "bybit".to_string(),
-                Exchange::BinanceSwapDec => "binance_futures_dec".to_string(),
                 Exchange::BitgetSwap => "bitget_futures".to_string(),
-                Exchange::BinanceSwapInc => "binance_futures_increment".to_string(),
             })
             .collect();
         if let Some(conf) = database.clone() {
@@ -147,9 +146,8 @@ impl DataLoader {
                 Exchange::KrakenSpot => "kraken".to_string(),
                 Exchange::BinanceSwap => "binance_futures".to_string(),
                 Exchange::BybitSwap => "bybit".to_string(),
-                Exchange::BinanceSwapDec => "binance_futures_dec".to_string(),
                 Exchange::BitgetSwap => "bitget_futures".to_string(),
-                Exchange::BinanceSwapInc => "binance_futures_increment".to_string(),
+                Exchange::OkxSwap => "okx_futures".to_string(),
             })
             .collect();
 
@@ -225,9 +223,8 @@ impl DataLoader {
                 Exchange::KrakenSpot => "kraken".to_string(),
                 Exchange::BinanceSwap => "binance_futures".to_string(),
                 Exchange::BybitSwap => "bybit".to_string(),
-                Exchange::BinanceSwapDec => "binance_futures_dec".to_string(),
                 Exchange::BitgetSwap => "bitget_futures".to_string(),
-                Exchange::BinanceSwapInc => "binance_futures_increment".to_string(),
+                Exchange::OkxSwap => "okx_futures".to_string(),
             })
             .collect();
 
@@ -260,7 +257,7 @@ impl DataLoader {
         let statement = client.query(&query);
         let ret = statement.fetch_all::<Depth>().await;
         match ret {
-            Ok(mut data) => {
+            Ok(data) => {
                 debug!("query success");
                 if !data.is_empty() {
                     if data.len() < self.limit {
@@ -269,13 +266,6 @@ impl DataLoader {
                     }
                     self.last_timestamp_depth = end_time  + 1;
                 }
-                if exchange_list.contains(&"binance_futures_dec".to_string()) {
-                    for depth in data.iter_mut() {
-                        if depth.symbol.is_empty(){
-                            depth.symbol = self.config.symbol.clone();
-                        }
-                    }
-                }// bugs: binance_futures_dec is empty
                 Ok(data)
             }
             Err(e) => {
@@ -294,13 +284,16 @@ impl DataLoader {
 
 #[cfg(test)]
 mod tests {
+    use crate::ZConfig;
+
     use super::BtConfig;
     use super::DataLoader;
 
     #[tokio::test]
     async fn test_data_loader() {
         let config = BtConfig::default();
-        DataLoader::new(10_000, &config)
+        let zconfig = ZConfig::parse("misc/config.tmol");
+        DataLoader::new(10_000, &config, zconfig)
             .await
             .load_data()
             .await

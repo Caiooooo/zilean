@@ -11,11 +11,10 @@ pub enum Exchange {
     BinanceSpot,
     CoinbaseSpot,
     OkxSpot,
+    OkxSwap,
     KrakenSpot,
     BinanceSwap,
     BybitSwap,
-    BinanceSwapDec,
-    BinanceSwapInc,
     BitgetSwap,
 }
 
@@ -317,7 +316,7 @@ impl Position {
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Order {
     // for futures
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub contract_type: ContractType,
     #[serde(default)]
     pub position_side: PositionSide,
@@ -342,6 +341,7 @@ pub struct Order {
     pub symbol: String,
     pub price: f64,
     pub amount: f64,
+    #[serde(default)]
     pub filled_amount: f64,
     #[serde(default = "default_amount", skip)]
     pub front_amount: f64,
@@ -571,6 +571,7 @@ where
         "kraken" => Ok(Exchange::KrakenSpot),
         "okx" => Ok(Exchange::OkxSpot),
         "okex" => Ok(Exchange::OkxSpot),
+        "okx_futures" => Ok(Exchange::OkxSwap),
         "binance-futures" => Ok(Exchange::BinanceSwap),
         "BinanceSpot" => Ok(Exchange::BinanceSpot),
         "CoinbaseSpot" => Ok(Exchange::CoinbaseSpot),
@@ -579,7 +580,6 @@ where
         "OkexSpot" => Ok(Exchange::OkxSpot),
         "bybit" => Ok(Exchange::BybitSwap),
         "bitget_futures" => Ok(Exchange::BitgetSwap),
-        "binance_swap" => Ok(Exchange::BinanceSwapDec),
         "bybit_swap" => Ok(Exchange::BybitSwap),
         "bitget_swap" => Ok(Exchange::BitgetSwap),
         // 更多匹配

@@ -109,10 +109,11 @@ socket_server.connect("ipc:///tmp/zilean_backtest.ipc")
 
 # 定义回测参数
 backtest_params = {
-    "exchanges": ["BinanceSpot"],
+    "contract_type": "Spot",
+    "exchanges": ["OkxSwap"],
     "symbol": "BTC_USDT",
     "start_time": 0,
-    "end_time": 1728885047114,
+    "end_time": 1728885047114000,
     "balance": {
         "total": 100000000,
         "available": 100000000,
@@ -137,22 +138,26 @@ socket_bt.connect(f"ipc:///tmp/zilean_backtest/{backtest_id}.ipc")
 cnt = 0
 start_time = time.time()
 
+
 while cnt < 1000000:
     # 获取下一个时间点的 orderbook 数据
     try:
         tick_data = get_data(socket_bt, 'TICK')
+        data = tick_data.get('message', {}).encode('utf-8')
+        message = json.loads(data)
+        exit()
     except:
-        for i in range(cnt):
-            cancel_order(socket_bt, cnt)
-    
-    message = json.loads(tick_data.get('message', {}).encode('utf-8'))
+        if data == 'No more data, backtestfinished':
+            break
     depth = message.get('depth', 0)
     acc_info = message.get('account', {})
 
     print(f"Received tick data: {acc_info}")
-    asks = message.get('asks', [])
-    bids = message.get('bids', [])
-
+    asks = depth.get('asks', [])
+    bids = depth.get('bids', [])
+    # 获取 BTC_USDT 的可用仓位数量
+    btc_position = acc_info.get('position', {}).get('BTC_USDT', [])
+    btc_amount = btc_position[0].get('amount_available', 0.0) if btc_position else 0.0
     if asks and bids and cnt % 1000 == 0:
         # 获取最高买价和最低卖价进行下单测试
         best_bid = float(bids[0][0])  # 最高买价
@@ -161,16 +166,13 @@ while cnt < 1000000:
         print(f"Best bid: {best_bid}, Best ask: {best_ask}")
 
         # 测试下单逻辑：以最低卖价买入
-        order_response = post_order(socket_bt, "BinanceSpot", cnt, "BTC_USDT", best_ask-0.1, 1.0, side="Buy")
+        order_response = post_order(socket_bt, "OkxSwap", cnt, "BTC_USDT", best_ask-0.1, 0.001, side="Buy")
         # 测试下单逻辑：以最高卖价卖出
-        order_response = post_order(socket_bt, "BinanceSpot", cnt, "BTC_USDT", best_bid+0.1, 1.0, side="Sell")
+        order_response = post_order(socket_bt, "OkxSwap", cnt, "BTC_USDT", best_bid+0.1, 0.001, side="Sell")
         print(f"Order Response: {order_response}")
 
         # cancel_order(bt_socket, cnt)
         # 检查账户信息是否正确
-        if acc_info.get('status') != 'ok':
-            print('Error fetching account info')
-            break
     cnt += 1
 
         
