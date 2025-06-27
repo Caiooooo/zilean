@@ -1,5 +1,5 @@
 use core::fmt;
-use serde::Serialize;
+use sonic_rs::{Deserialize, Serialize};
 // use rustc_hash::FxHashMap;
 // use std::sync::{Arc, Mutex};
 
@@ -38,23 +38,30 @@ impl ZileanServer {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BacktestResponse {
-    pub status: String,
+    pub status: BacktestStatus,
     pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum BacktestStatus {
+    Ok,
+    Error,
 }
 
 impl BacktestResponse {
     pub fn bad_request(message: String) -> Self {
         Self {
-            status: "error".to_string(),
+            status: BacktestStatus::Error,
             message,
         }
     }
 
     pub fn normal_response(message: String) -> Self {
         Self {
-            status: "ok".to_string(),
+            status: BacktestStatus::Ok,
             message,
         }
     }

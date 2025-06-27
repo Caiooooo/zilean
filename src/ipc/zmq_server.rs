@@ -1,7 +1,9 @@
 use zmq::Context;
 use log::info;
 
-use crate::{engine::ZileanV1, market::Order, server::BacktestResponse};
+use crate::engine::ZileanV1;
+use super::traits::MessageResponder;
+use super::handlers::{ZmqResponder, ZileanCommandHandler};
 
 impl ZileanV1{
     // controller for backtest server
@@ -24,8 +26,6 @@ impl ZileanV1{
         responder
             .set_rcvtimeo(100000) // receive timeout 100 s
             .expect("Failed to set receive timeout");
-        // TODO let dir = url[6..url.len() - 4].to_string() + ".ipc";
-        // delete the repete file
 
         // 检查并创建目录
         if let Some(dir_path) = url.strip_prefix("ipc://") {
@@ -37,8 +37,13 @@ impl ZileanV1{
         }
         responder.bind(&url).expect("Failed to bind socket");
         info!("bt-server {} connected.", self.account.backtest_id);
+        
+        // 创建响应器和命令处理器
+        let message_responder = ZmqResponder::new(responder);
+        let mut command_handler = ZileanCommandHandler::new();
+        let _ = command_handler.update_tick_cache(self).await;
         loop {
-            let message = match responder.recv_string(0) {
+            let message = match message_responder.socket.recv_string(0) {
                 Ok(msg) => msg.unwrap(),
                 Err(e) => {
                     // connection interrupted
@@ -46,71 +51,38 @@ impl ZileanV1{
                         info!("Connection {} recv timeout.", self.account.backtest_id);
                         break;
                     }
-                    let response = sonic_rs::to_string(&BacktestResponse::bad_request(format!(
-                        "Error prasing string, {}.",
-                        e
-                    )))
-                    .unwrap();
-                    let _ = responder.send(response.as_str(), 0);
+                    let _ = message_responder.send_error(&format!("Error parsing string: {}", e));
                     continue;
                 }
             };
-            if message.starts_with("TICK") {
-                // execute on_tick and send response
-                responder
-                    .send(self.next_tick.as_str(), 0)
-                    .expect("Failed to send tick data.");
-                let tick = self.on_tick().await;
-                let tick_response =
-                    sonic_rs::to_string(&tick).expect("Failed to serialize tick data");
-                self.next_tick = tick_response;
-            } else if let Some(stripped) = message.strip_prefix("POST_ORDER") {
-                let order: Order = match sonic_rs::from_str(stripped) {
-                    Ok(order) => order,
-                    Err(e) => {
-                        log::error!("Error parsing order: {}", e);
-                        let response = sonic_rs::to_string(&BacktestResponse::bad_request(
-                            format!("Error parsing order: {}", e),
-                        ))
-                        .unwrap();
-                        let _ = responder.send(response.as_str(), 0);
-                        continue;
+            
+            // 使用命令处理器处理其他命令
+            match command_handler.handle_command_with_engine(self, &message) {
+                Ok(response) => {
+                    // 特殊处理CLOSE/TICK命令
+                    if message.starts_with("CLOSE") {
+                        let _ = message_responder.send_response(&response);
+                        break;
                     }
-                };
-                let response = self.post_order(order);
-                let response = sonic_rs::to_string(&response).unwrap();
-                let _ = responder.send(response.as_str(), 0);
-            } else if let Some(stripped) = message.strip_prefix("CLOSE_POSITION") {
-                let symbol = stripped.to_string();
-                let response = self.cancel_order(symbol);
-                let response = sonic_rs::to_string(&response).unwrap();
-                let _ = responder.send(response.as_str(), 0);
-            } else if let Some(stripped) = message.strip_prefix("CANCEL_ORDER") {
-                let cid = stripped.to_string();
-                let response = self.cancel_order(cid);
-                let response = sonic_rs::to_string(&response).unwrap();
-                let _ = responder.send(response.as_str(), 0);
-            } else if message.starts_with("CLOSE") {
-                info!("Server closed.");
-                let response = sonic_rs::to_string(&BacktestResponse::normal_response(
-                    "Server closed.".to_string(),
-                ))
-                .unwrap();
-                responder
-                    .send(response.as_str(), 0)
-                    .expect("Failed to send unknown command response.");
-                break;
-            } else {
-                let response = sonic_rs::to_string(&BacktestResponse::bad_request(
-                    "Unknown command.".to_string(),
-                ))
-                .unwrap();
-                responder
-                    .send(response.as_str(), 0)
-                    .expect("Failed to send unknown command response.");
+                    
+                    if let Err(e) = message_responder.send_response(&response) {
+                        log::error!("Failed to send response: {}", e);
+                    }
+
+                    if message.starts_with("TICK") {
+                        // 更新缓存的tick数据
+                        if let Err(e) = command_handler.update_tick_cache(self).await {
+                            log::error!("Failed to update tick cache: {}", e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    log::error!("Command handling error: {}", e);
+                    let _ = message_responder.send_error(&e);
+                }
             }
         }
-        self.close_bt(responder, tick_url).await;
+        
+        self.close_bt(message_responder.socket, tick_url).await;
     }
-
 }

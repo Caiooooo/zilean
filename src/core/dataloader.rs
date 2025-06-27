@@ -72,10 +72,9 @@ impl DataLoader {
                 let ret = client.query(&query).fetch_all::<Depth>().await;
                 match ret {
                     Ok(data) => {
-                        if !data.is_empty() {
-                            start_time = data.first().unwrap().local_timestamp.max(start_time);
+                        if let Some(first) = data.first() {
+                            start_time = first.local_timestamp.max(start_time);
                         }
-                        
                     }
                     Err(e) => {
                         error!("query failed invailed time: {:?}", e);
@@ -91,8 +90,8 @@ impl DataLoader {
                 (&query_trade).fetch_all::<Trade>().await;
                 match ret {
                     Ok(data) => {
-                        if !data.is_empty() {
-                            start_time = data.first().unwrap().timestamp.max(start_time);
+                        if let Some(first) = data.first() {
+                            start_time = first.timestamp.max(start_time);
                         }
                     }
                     Err(e) => {
@@ -129,7 +128,10 @@ impl DataLoader {
     }
 
     async fn load_trade_from_database(&mut self) -> Result<Vec<Trade>, std::io::Error> {
-        let dbconf = self.database.clone().unwrap();
+        let dbconf = self.database.clone().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Database configuration is missing",
+        ))?;
         let client = Client::default()
             .with_url(format!("{}:{}", dbconf.host, dbconf.port))
             .with_user(dbconf.username)
@@ -206,7 +208,10 @@ impl DataLoader {
     }
 
     async fn load_from_database(&mut self) -> Result<Vec<Depth>, std::io::Error> {
-        let dbconf = self.database.clone().unwrap();
+        let dbconf = self.database.clone().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Database configuration is missing",
+        ))?;
         let client = Client::default()
             .with_url(format!("{}:{}", dbconf.host, dbconf.port))
             .with_user(dbconf.username)

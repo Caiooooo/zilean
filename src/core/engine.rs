@@ -2,6 +2,9 @@ use crate::dataloader::DataSource;
 use crate::{market::*, ZConfig};
 use crate::round::round6;
 use rand::Rng;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 // use rustc_hash::FxHashMap;
 use super::{dataloader::DataLoader, server::BacktestResponse};
 use log::{debug, info};
@@ -13,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub enum BacktestState {
     #[default]
     Ready,
@@ -42,7 +45,10 @@ impl LatencyModel {
                 ..order
             },
             LatencyModel::Positivedistribution(mean, std) => {
-                let normal = Normal::new(*mean, *std).unwrap();
+                let normal = Normal::new(*mean, *std).map_err(|e| {
+                    log::error!("Normal distribution creation failed: {:?}", e);
+                    e
+                }).unwrap_or_else(|_| Normal::new(0.0, 1.0).unwrap());
                 let latency = normal.sample(&mut rand::thread_rng()).max(0.0); // Ensure latency is non-negative
                 Order {
                     timestamp: order.timestamp + latency as i64,
@@ -119,7 +125,10 @@ pub struct BtConfig {
 
 impl BtConfig {
     pub fn parse(config: &str) -> BtConfig {
-        sonic_rs::from_str(config).expect("Failed to parse config")
+        sonic_rs::from_str(config).unwrap_or_else(|_| {
+            log::error!("Failed to parse config");
+            BtConfig::default()
+        })
     }
 }
 
@@ -173,14 +182,14 @@ impl OrderList {
                     contract_type: order.contract_type.clone(),
                     side: order.position_side.clone(),
                     leverage: order.leverage,
-                    take_profit: order.take_profit,
-                    stop_loss: order.stop_loss,
-                    filled_price,
-                    filled_amount,
-                    open_price: order.open_price,
-                    post_price: order.price,
-                    freeze_margin: order.margin,
-                    amount_total: order.amount,
+                    take_profit: order.take_profit.map(|v| Decimal::from_f64(v).unwrap_or(dec!(0))),
+                    stop_loss: order.stop_loss.map(|v| Decimal::from_f64(v).unwrap_or(dec!(0))),
+                    filled_price: Decimal::from_f64(filled_price).unwrap_or(dec!(0)),
+                    filled_amount: Decimal::from_f64(filled_amount).unwrap_or(dec!(0)),
+                    open_price: order.open_price.map(|v| Decimal::from_f64(v).unwrap_or(dec!(0))),
+                    post_price: Decimal::from_f64(order.price).unwrap_or(dec!(0)),
+                    freeze_margin: Decimal::from_f64(order.margin).unwrap_or(dec!(0)),
+                    amount_total: Decimal::from_f64(order.amount).unwrap_or(dec!(0)),
                 });
             }
             true
@@ -197,15 +206,14 @@ pub struct FilledStack {
     pub side: PositionSide,
     pub contract_type: ContractType,
     pub leverage: u32,
-    pub take_profit: Option<f64>,
-    pub stop_loss: Option<f64>,
-    pub open_price: Option<f64>,
-    pub filled_price: f64,
-    
-    pub filled_amount: f64,
-    pub post_price: f64,
-    pub freeze_margin: f64,
-    pub amount_total: f64,
+    pub take_profit: Option<Decimal>,
+    pub stop_loss: Option<Decimal>,
+    pub open_price: Option<Decimal>,
+    pub filled_price: Decimal,
+    pub filled_amount: Decimal,
+    pub post_price: Decimal,
+    pub freeze_margin: Decimal,
+    pub amount_total: Decimal,
 }
 
 #[derive(Serialize, Default)]
@@ -257,7 +265,10 @@ impl ZileanV1 {
             next_tick: "".to_string(),
         }
     }
-
+    
+    pub fn get_status(&self) -> BacktestState {
+        self.state.clone()
+    }
     pub async fn launch(
         &mut self,
         backtest_id: String,
@@ -346,7 +357,7 @@ impl ZileanV1 {
                     ..Default::default()
                 })
                 .local_timestamp
-                .cmp(&self.data_cache.front().unwrap().local_timestamp),
+                .cmp(&self.data_cache.front().map(|d| d.local_timestamp).unwrap_or(i64::MAX)),
             std::cmp::Ordering::Less
         );
         if is_trade {
@@ -362,7 +373,7 @@ impl ZileanV1 {
         if !self.zconfig.use_trade{
             self.match_orders();
         }
-        let mut depth = self.data_cache.pop_front().unwrap();
+        let mut depth = self.data_cache.pop_front().unwrap_or_default();
         for ask in depth.asks.iter_mut() {
             ask.1 = (ask.1 * 1e6).round() / 1e6;
         }
@@ -381,7 +392,7 @@ impl ZileanV1 {
             account: self.account.clone(),
             orders: self.order_list.clone(),
         };
-        BacktestResponse::normal_response(sonic_rs::to_string(&tick_response).unwrap())
+        BacktestResponse::normal_response(sonic_rs::to_string(&tick_response).unwrap_or_else(|_| "{{}}".to_string()))
     }
 
     // check for forced liquidation and stop loss conditions
@@ -394,7 +405,7 @@ impl ZileanV1 {
             PositionSide::Long,
             depth.exchange,
         ));
-        let mut total_amount = 0.0;
+        let mut total_amount = dec!(0);
         let mid_price = (depth.asks[0].0 + depth.bids[0].0) / 2.0;
 
         if let Some(position) = position_long {
@@ -405,7 +416,7 @@ impl ZileanV1 {
 
             for (index, loss) in position.stop_loss.iter_mut().enumerate() {
                 total_amount += loss.1;
-                if mid_price < loss.0 {
+                if Decimal::from_f64(mid_price).unwrap_or(dec!(0)) < loss.0 {
                     let stop_loss_order = Order {
                         contract_type: ContractType::Futures,
                         symbol: depth.symbol.clone(),
@@ -415,7 +426,7 @@ impl ZileanV1 {
                         leverage: position.leverage,
                         cid: "st-".to_string() + depth.symbol.clone().as_str(),
                         price: 0.0,
-                        amount: loss.1,
+                        amount: loss.1.to_f64().unwrap_or(0.0),
                         side: OrderSide::Sell,
                         timestamp: 0,
                         ..Default::default()
@@ -436,7 +447,7 @@ impl ZileanV1 {
             PositionSide::Short,
             depth.exchange,
         ));
-        total_amount = 0.0;
+        total_amount = dec!(0);
 
         if let Some(position) = position_short {
             // Sort the position by stop_loss price (descending)
@@ -446,7 +457,7 @@ impl ZileanV1 {
 
             for (index, loss) in position.stop_loss.iter_mut().enumerate() {
                 total_amount += loss.1;
-                if mid_price > loss.0 {
+                if Decimal::from_f64(mid_price).unwrap_or(dec!(0)) > loss.0 {
                     let stop_loss_order = Order {
                         contract_type: ContractType::Futures,
                         symbol: depth.symbol.clone(),
@@ -456,7 +467,7 @@ impl ZileanV1 {
                         leverage: position.leverage,
                         cid: "st-".to_string() + depth.symbol.clone().as_str(),
                         price: 1e6,
-                        amount: loss.1,
+                        amount: loss.1.to_f64().unwrap_or(0.0),
                         side: OrderSide::Sell,
                         timestamp: 0,
                         ..Default::default()
@@ -516,22 +527,24 @@ impl ZileanV1 {
     // return cid when success
     pub fn post_order(&mut self, mut order: Order) -> BacktestResponse {
         // check account balance, fix the amount and price
-        if (order.amount - ((order.amount * 1e6).round() / 1e6)).abs() >= 1e-7 {
+        let dec_amount = Decimal::from_f64(order.amount).unwrap_or(dec!(0));
+        let dec_price = Decimal::from_f64(order.price).unwrap_or(dec!(0));
+        if (dec_amount - (dec_amount * dec!(1e6)).round() / dec!(1e6)).abs() >= dec!(1e-7) {
             return BacktestResponse::bad_request(
                 "Invalid amount, position fix too small.".to_string(),
             );
         }
-        if (order.price - ((order.price * 1e12).round() / 1e12)).abs() >= 1e-13 {
+        if (dec_price - (dec_price * dec!(1e12)).round() / dec!(1e12)).abs() >= dec!(1e-13) {
             return BacktestResponse::bad_request(
                 "Invalid amount, position fix too small.".to_string(),
             );
         }
-        if order.price <= 0.0 || order.amount <= 0.0 {
+        if dec_price <= dec!(0) || dec_amount <= dec!(0) {
             return BacktestResponse::bad_request("Invalid order.".to_string());
         }
         // TODO: change front amount
-        order.amount = (order.amount * 1e6).round() / 1e6;
-        order.price = (order.price * 1e12).round() / 1e12;
+        // order.amount = (dec_amount * dec!(1e6)).round() / dec!(1e6);
+        // order.price = (dec_price * dec!(1e12)).round() / dec!(1e12);
         let amount = order.amount;
         let post_value = order.price * amount;
         // check margin for Spot
@@ -549,13 +562,13 @@ impl ZileanV1 {
 
             match order.side {
                 OrderSide::Sell => {
-                    if position.amount_available < order.amount {
+                    if position.amount_available < dec_amount {
                         return BacktestResponse::bad_request("Insufficient amount.".to_string());
                     }
-                    position.add_freezed(order.amount);
+                    position.add_freezed(dec_amount);
                 }
                 OrderSide::Buy => {
-                    self.account.balance.add_freezed(post_value);
+                    self.account.balance.add_freezed(Decimal::from_f64(post_value).unwrap_or(dec!(0)));
                 }
             }
         } else if order.contract_type == ContractType::Futures {
@@ -577,7 +590,7 @@ impl ZileanV1 {
             // increase leverage, decrease margin
             match order.side {
                 OrderSide::Sell => {
-                    if position.amount_available < order.amount {
+                    if position.amount_available < dec_amount {
                         // The corresponding quantity of orders with higher prices,
                         // such as the original order price of 100, now the order price of 50, the order of 100 needs to be canceled
                         let mut temp_vec: Vec<_> = self.order_list.inner.iter().cloned().collect();
@@ -614,18 +627,20 @@ impl ZileanV1 {
                         }
                         return BacktestResponse::bad_request("Insufficient amount, Canceled the amount out of position automatically.".to_string());
                     }
-                    position.add_freezed(order.amount);
-                    order.open_price = Some(position.entry_price);
+                    position.add_freezed(dec_amount);
+                    order.open_price = Some(position.entry_price.to_f64().unwrap_or(0.0));
                 }
                 OrderSide::Buy => {
                     let margin_value_need =
                         round6(order.amount / order.leverage as f64 * order.price);
-                    if margin_value_need > self.account.balance.get_available() {
+                    let dec_margin_value_need = Decimal::from_f64(margin_value_need).unwrap_or(dec!(0));
+                    if dec_margin_value_need > self.account.balance.get_available() {
                         return BacktestResponse::bad_request("Insufficient margin.".to_string());
                     }
                     if let Some(loss) = order.stop_loss {
-                        if (loss > order.price && order.position_side == PositionSide::Long)
-                            || (loss < order.price && order.position_side == PositionSide::Short)
+                        let dec_loss = Decimal::from_f64(loss).unwrap_or(dec!(0));
+                        if (dec_loss > dec_price && order.position_side == PositionSide::Long)
+                            || (dec_loss < dec_price && order.position_side == PositionSide::Short)
                         {
                             return BacktestResponse::bad_request(
                                 "Stop loss invailed.".to_string(),
@@ -633,19 +648,20 @@ impl ZileanV1 {
                         }
                         let mut found = false;
                         for loss_list in position.stop_loss.iter_mut() {
-                            if loss_list.0 == loss {
-                                loss_list.1 += order.amount;
+                            if loss_list.0 == dec_loss {
+                                loss_list.1 += dec_amount;
                                 found = true;
                                 break;
                             }
                         }
                         if !found {
-                            position.stop_loss.push((loss, order.amount));
+                            position.stop_loss.push((dec_loss, dec_amount));
                         }
                     }
                     if let Some(profit) = order.take_profit {
-                        if (profit < order.price && order.position_side == PositionSide::Long)
-                            || (profit > order.price && order.position_side == PositionSide::Short)
+                        let dec_profit = Decimal::from_f64(profit).unwrap_or(dec!(0));
+                        if (dec_profit < dec_price && order.position_side == PositionSide::Long)
+                            || (dec_profit > dec_price && order.position_side == PositionSide::Short)
                         {
                             return BacktestResponse::bad_request(
                                 "Take profit invailed.".to_string(),
@@ -653,8 +669,8 @@ impl ZileanV1 {
                         }
                     }
                     position.leverage = order.leverage;
-                    if margin_value_need > 0.0 {
-                        self.account.balance.add_freezed(margin_value_need);
+                    if dec_margin_value_need > dec!(0) {
+                        self.account.balance.add_freezed(dec_margin_value_need);
                         order.margin = margin_value_need;
                     }
                 }
@@ -662,7 +678,6 @@ impl ZileanV1 {
         }
         // update account
         let cid = order.cid.clone();
-        // print!("{:?}, {:?}", post_value, amount);
         self.order_list
             .insert_order(self.latency.order_with_latency(order));
 
@@ -685,7 +700,7 @@ impl ZileanV1 {
             if order.side == OrderSide::Buy {
                 self.account
                     .balance
-                    .sub_freezed(value / order.leverage as f64);
+                    .sub_freezed(Decimal::from_f64(value / order.leverage as f64).unwrap_or(dec!(0)));
             } else {
                 self.account
                     .position
@@ -695,7 +710,7 @@ impl ZileanV1 {
                         order.exchange,
                     ))
                     .or_default()
-                    .sub_freezed(amount);
+                    .sub_freezed(Decimal::from_f64(amount).unwrap_or(dec!(0)));
             }
             order.state = OrderState::Canceled;
             order.timestamp = self.depth.local_timestamp;
@@ -727,11 +742,18 @@ impl ZileanV1 {
                 .or_default();
             self.account.balance.fill_freezed(&filled);
             account.update_pos(&filled);
-            info!("current orders: {:?}", self.order_list.inner);
+            // info!("current first orders: {:?}", self.order_list.inner);
+            // if order too much, warning!
+            if self.order_list.inner.len() > 1000 {
+                log::warn!(
+                    "Order list too long: {}, consider to cancel some orders.",
+                    self.order_list.inner.len()
+                );
+            }
             // take profit
             if filled.take_profit.is_some()
-                && ((filled.filled_amount > 0.0 && filled.side == PositionSide::Long)
-                    || (filled.filled_amount < 0.0 && filled.side == PositionSide::Short))
+                && ((filled.filled_amount > dec!(0) && filled.side == PositionSide::Long)
+                    || (filled.filled_amount < dec!(0) && filled.side == PositionSide::Short))
             {
                 let take_profit_order = Order {
                     cid: format!("tp-{}", filled.cid),
@@ -740,11 +762,11 @@ impl ZileanV1 {
                     position_side: filled.side.clone(),
                     contract_type: filled.contract_type.clone(),
                     side: OrderSide::Sell,
-                    price: filled.take_profit.unwrap(),
-                    amount: filled.filled_amount.abs(),
+                    price: filled.take_profit.unwrap().to_f64().unwrap_or(0.0),
+                    amount: filled.filled_amount.abs().to_f64().unwrap_or(0.0),
                     leverage: filled.leverage,
                     timestamp: depth.local_timestamp,
-                    margin: filled.freeze_margin,
+                    margin: filled.freeze_margin.to_f64().unwrap_or(0.0),
                     state: OrderState::Open,
                     ..Default::default()
                 };
@@ -762,7 +784,7 @@ impl ZileanV1 {
         );
         responder
             .disconnect(format!("{}{}.ipc", tick_url, self.account.backtest_id).as_str())
-            .unwrap();
+            .unwrap_or_else(|e| log::error!("Failed to disconnect: {:?}", e));
     }
 }
 

@@ -24,13 +24,11 @@ toml = { version = "0.8.19", default-features = false, features = ["parse"] }
 tokio = { version = "1.40.0", default-features = false, features = ["rt-multi-thread", "macros"] }
 rand_distr = "0.4"
 num_cpus = "1.16.0"
+rust_decimal = "1.37.2"
+rust_decimal_macros = "1.37.1"
 
 [dev-dependencies]
 criterion = { version = "0.3.5", features = ["async_tokio", "html_reports"] }
-
-[[bench]]
-name = "client_request"
-harness = false
 
 [profile.release]
 debug = true

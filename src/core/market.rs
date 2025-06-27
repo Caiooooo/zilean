@@ -4,6 +4,8 @@ use log::info;
 use serde::ser::Serializer;
 use sonic_rs::{Deserialize, Serialize};
 use std::collections::HashMap;
+use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal_macros::dec;
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum Exchange {
@@ -74,24 +76,24 @@ pub struct ClosePosition {
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Balance {
-    total: f64,
-    available: f64,
-    freezed: f64,
+    total: Decimal,
+    available: Decimal,
+    freezed: Decimal,
     // #[serde(skip_serializing)]
     // maker_fee: f64, // to add when stable in the future
 }
 
 impl Balance {
-    pub fn get_available(&self) -> f64 {
+    pub fn get_available(&self) -> Decimal {
         self.available
     }
 
-    pub fn add_freezed(&mut self, value: f64) {
+    pub fn add_freezed(&mut self, value: Decimal) {
         self.freezed += value;
         self.available -= value;
     }
 
-    pub fn sub_freezed(&mut self, value: f64) {
+    pub fn sub_freezed(&mut self, value: Decimal) {
         self.freezed -= value;
         self.available += value;
     }
@@ -104,12 +106,12 @@ impl Balance {
     pub fn fill_freezed_futures(&mut self, filled: &FilledStack) {
         info!("bal filled: {:?}, before filled: t{}, a{}, f{}", filled, self.total, self.available, self.freezed);
         let amount = filled.filled_amount;
-        let value = ((filled.filled_price * filled.filled_amount / filled.leverage as f64) * 1e12).round()/1e12;
-        let freeze = ((filled.post_price * filled.filled_amount / filled.leverage as f64) * 1e12).round()/1e12;
-        let value_open = (filled.open_price.unwrap_or(filled.filled_price) * filled.filled_amount / filled.leverage as f64 * 1e12).round()/1e12;
+        let value = (filled.filled_price * amount / Decimal::from_u32(filled.leverage).unwrap_or(dec!(1))).round_dp(12);
+        let freeze = (filled.post_price * amount / Decimal::from_u32(filled.leverage).unwrap_or(dec!(1))).round_dp(12);
+        let value_open = (filled.open_price.unwrap_or(filled.filled_price) * amount / Decimal::from_u32(filled.leverage).unwrap_or(dec!(1))).round_dp(12);
         if filled.side == PositionSide::Long {
             // open long:amount>0  / close long: amount<0 
-            if amount > 0.0 {
+            if amount > dec!(0) {
                 // println!("value: {}, freeze: {}, available: {}, lev: {}", value, freeze, self.available, filled.leverage);
                 self.total -= value ;
                 // println!("filled.freeze_mar: {}, amount: {}, amount_tol: {}", filled.freeze_margin, amount, filled.amount_total);
@@ -122,13 +124,13 @@ impl Balance {
                 self.total -= value_open ;
                 self.available -= value_open ;
                 
-                self.total += filled.filled_amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
-                self.available += filled.filled_amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
+                self.total += amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
+                self.available += amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
                 // println!("value: {}, freeze: {}", value * (filled.leverage - 1) as f64, value * filled.leverage as f64);
             }
         } else if filled.side == PositionSide::Short {
             // open short:amount<0  / close short: amount>0 
-            if amount < 0.0 {
+            if amount < dec!(0) {
                 self.total += value ;
                 self.freezed += freeze;
                 self.available -= freeze - value ;
@@ -136,8 +138,8 @@ impl Balance {
                 self.total += value_open ;
                 self.available += value_open ;
                 
-                self.total -= filled.filled_amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
-                self.available -= filled.filled_amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
+                self.total -= amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
+                self.available -= amount * (filled.filled_price - filled.open_price.unwrap_or(filled.filled_price));
             }
         }
         info!("bal filled: {:?}, after filled: t{}, a{}, f{}", filled.cid, self.total, self.available, self.freezed);
@@ -155,7 +157,7 @@ impl Balance {
         let freeze_price = filled.post_price;
         self.total -= price * amount;
         // buy coin, amount > 0, available increase
-        if amount > 0.0 {
+        if amount > dec!(0) {
             self.freezed -= freeze_price * amount;
             self.available += (freeze_price - price) * amount;
         } else {
@@ -164,9 +166,9 @@ impl Balance {
     }
 
     pub fn round(&mut self) {
-        self.freezed = (self.freezed * 1e12).round() / 1e12;
-        self.available = (self.available * 1e12).round() / 1e12;
-        self.total = (self.total * 1e12).round() / 1e12;
+        self.freezed = self.freezed.round_dp(12);
+        self.available = self.available.round_dp(12);
+        self.total = self.total.round_dp(12);
     }
 }
 
@@ -219,13 +221,13 @@ pub struct Position {
     pub side: PositionSide,
     pub exchange: Exchange,
     pub leverage: u32,
-    pub margin_value: f64,
-    pub amount_total: f64,
-    pub amount_available: f64,
-    pub amount_freezed: f64,
-    pub entry_price: f64,
+    pub margin_value: Decimal,
+    pub amount_total: Decimal,
+    pub amount_available: Decimal,
+    pub amount_freezed: Decimal,
+    pub entry_price: Decimal,
     // entry_time: i64,
-    pub stop_loss: Vec<(f64, f64)>,
+    pub stop_loss: Vec<(Decimal, Decimal)>,
 }
 
 impl Position {
@@ -240,9 +242,9 @@ impl Position {
             if filled.side == PositionSide::Long {
                 // open long:amount>0 / close long: amount<0
                 self.amount_total += amount;
-                if amount>0.0{ // open long
-                    if self.amount_total == 0.0 {
-                        self.entry_price = 0.0;
+                if amount > dec!(0) { // open long
+                    if self.amount_total == dec!(0) {
+                        self.entry_price = dec!(0);
                     } else {
                         self.entry_price = (old_value + amount.abs() * price) / self.amount_total;
                     }
@@ -253,9 +255,9 @@ impl Position {
             }else if filled.side == PositionSide::Short {
                 // println!("{:?}", amount);
                 self.amount_total -= amount;
-                if amount<0.0{ // open short
-                    if self.amount_total == 0.0 {
-                        self.entry_price = 0.0;
+                if amount < dec!(0) { // open short
+                    if self.amount_total == dec!(0) {
+                        self.entry_price = dec!(0);
                     } else {
                         self.entry_price = (old_value + amount.abs() * price) / self.amount_total;
                     }
@@ -264,21 +266,21 @@ impl Position {
                     self.amount_freezed -= amount;
                 }
             }
-            if self.amount_total == 0.0 {
-                self.entry_price = 0.0;
+            if self.amount_total == dec!(0) {
+                self.entry_price = dec!(0);
             }
             
-            self.margin_value = self.amount_total * self.entry_price / filled.leverage as f64;
+            self.margin_value = self.amount_total * self.entry_price / Decimal::from_u32(filled.leverage).unwrap_or(dec!(1));
         }else if filled.contract_type == ContractType::Spot {
             self.amount_total += amount;
-            if amount > 0.0 {
+            if amount > dec!(0) {
                 self.amount_available += amount;
             } else {
                 self.amount_freezed += amount;
             }
 
-            if self.amount_total == 0.0 {
-                self.entry_price = 0.0;
+            if self.amount_total == dec!(0) {
+                self.entry_price = dec!(0);
             } else {
                 self.entry_price = (old_value + amount * price) / self.amount_total;
             }
@@ -286,12 +288,12 @@ impl Position {
         info!("pos filled: {:?}, after filled: t{}, a{}, f{}", filled.cid, self.amount_total, self.amount_available, self.amount_freezed);
     }
 
-    pub fn add_freezed(&mut self, value: f64) {
+    pub fn add_freezed(&mut self, value: Decimal) {
         self.amount_freezed += value;
         self.amount_available -= value;
     }
 
-    pub fn sub_freezed(&mut self, value: f64) {
+    pub fn sub_freezed(&mut self, value: Decimal) {
         self.amount_freezed -= value;
         self.amount_available += value;
     }
@@ -302,12 +304,11 @@ impl Position {
     // }
 
     pub fn round(&mut self) {
-        self.amount_freezed = (self.amount_freezed * 1e6).round() / 1e6;
-        self.amount_available = (self.amount_available * 1e6).round() / 1e6;
-        self.amount_total = (self.amount_total * 1e6).round() / 1e6;
-        if self.entry_price.is_nan() || self.entry_price.is_infinite() {
-            self.entry_price = 0.0;
-        }
+        self.amount_freezed = self.amount_freezed.round_dp(6);
+        self.amount_available = self.amount_available.round_dp(6);
+        self.amount_total = self.amount_total.round_dp(6);
+        // Decimal doesn't have is_nan/is_infinite, they're always valid
+        // No need to check for NaN or infinite values
     }
 }
 
@@ -658,12 +659,12 @@ mod tests {
             side: PositionSide::Long,
             exchange: Exchange::BinanceSwap,
             leverage: 10,
-            margin_value: 0.0,
-            amount_total: 0.0,
-            amount_available: 0.0,
-            amount_freezed: 0.0,
-            entry_price: 0.0,
-            stop_loss: vec![(0.0, 0.0)],
+            margin_value: dec!(0),
+            amount_total: dec!(0),
+            amount_available: dec!(0),
+            amount_freezed: dec!(0),
+            entry_price: dec!(0),
+            stop_loss: vec![(dec!(0), dec!(0))],
         };
         let filled = FilledStack {
             exchange: Exchange::BinanceSwap,
@@ -671,25 +672,25 @@ mod tests {
             side: PositionSide::Long,
             contract_type: ContractType::Futures,
             leverage: 10,
-            filled_price: 100.0,
-            filled_amount: 10.0,
-            post_price: 100.0,
+            filled_price: dec!(100),
+            filled_amount: dec!(10),
+            post_price: dec!(100),
             open_price: None,
             ..Default::default()
         };
         position.update_pos(&filled);
-        assert_eq!(position.amount_total, 10.0);
-        assert_eq!(position.amount_available, 10.0);
-        assert_eq!(position.entry_price, 100.0);
-        assert_eq!(position.margin_value, 100.0);
+        assert_eq!(position.amount_total, dec!(10));
+        assert_eq!(position.amount_available, dec!(10));
+        assert_eq!(position.entry_price, dec!(100));
+        assert_eq!(position.margin_value, dec!(100));
     }
 
     #[test]
     fn test_balance_update(){
         let balance = Balance{
-            total: 100.0,
-            available: 100.0,
-            freezed: 0.0,
+            total: dec!(100.0),
+            available: dec!(100.0),
+            freezed: dec!(0.0),
         };
         let mut account = Account{
             backtest_id: "test".to_string(),
@@ -714,10 +715,10 @@ mod tests {
             side: PositionSide::Long,
             contract_type: ContractType::Futures,
             leverage: 10,
-            filled_price: 0.035344,
-            filled_amount: 917.65,
-            post_price: 0.035344,
-            open_price: Some(0.035344),
+            filled_price: dec!(0.035344),
+            filled_amount: dec!(917.65),
+            post_price: dec!(0.035344),
+            open_price: Some(dec!(0.035344)),
             ..Default::default()
         };
 
@@ -727,10 +728,10 @@ mod tests {
             side: PositionSide::Long,
             contract_type: ContractType::Futures,
             leverage: 10,
-            filled_price: 0.035311,
-            filled_amount: 21716.0,
-            post_price: 0.035311,
-            open_price: Some(0.035311),
+            filled_price: dec!(0.035311),
+            filled_amount: dec!(21716.0),
+            post_price: dec!(0.035311),
+            open_price: Some(dec!(0.035311)),
             ..Default::default()
         };
 
@@ -740,10 +741,10 @@ mod tests {
             side: PositionSide::Long,
             contract_type: ContractType::Futures,
             leverage: 10,
-            filled_price: 0.035157,
-            filled_amount: 102.0,
-            post_price: 0.035157,
-            open_price: Some(0.035157),
+            filled_price: dec!(0.035157),
+            filled_amount: dec!(102.0),
+            post_price: dec!(0.035157),
+            open_price: Some(dec!(0.035157)),
             ..Default::default()
         };
 
@@ -753,10 +754,10 @@ mod tests {
             side: PositionSide::Long,
             contract_type: ContractType::Futures,
             leverage: 10,
-            filled_price: 0.034889,
-            filled_amount: 153.0,
-            post_price: 0.034889,
-            open_price: Some(0.034889),
+            filled_price: dec!(0.034889),
+            filled_amount: dec!(153.0),
+            post_price: dec!(0.034889),
+            open_price: Some(dec!(0.034889)),
             ..Default::default()
         };
 
@@ -766,10 +767,10 @@ mod tests {
             side: PositionSide::Long,
             contract_type: ContractType::Futures,
             leverage: 10,
-            filled_price: 0.034886,
-            filled_amount: -22888.65,
-            post_price: 0.034886,
-            open_price: Some(0.035344),
+            filled_price: dec!(0.034886),
+            filled_amount: dec!(-22888.65),
+            post_price: dec!(0.034886),
+            open_price: Some(dec!(0.035344)),
             ..Default::default()
         };
 

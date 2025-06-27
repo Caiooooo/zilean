@@ -141,14 +141,20 @@ start_time = time.time()
 
 while cnt < 1000000:
     # 获取下一个时间点的 orderbook 数据
-    try:
-        tick_data = get_data(socket_bt, 'TICK')
-        data = tick_data.get('message', {}).encode('utf-8')
-        message = json.loads(data)
-        exit()
-    except:
-        if data == 'No more data, backtestfinished':
-            break
+    tick_data = get_data(socket_bt, 'TICK')
+    data = tick_data.get('message', {}).encode('utf-8')
+    if data == b'No more data, backtestfinished':
+        print("No more data, backtest finished.")
+        break
+    message = json.loads(data)
+
+    
+    # if message == 'No more data, backtestfinished':
+    #     print("No more data, backtest finished.")
+    #     break
+    # if message.get('balance', {}).get('total', 0) == '99999428.9730':
+    #     print(tick_data)
+
     depth = message.get('depth', 0)
     acc_info = message.get('account', {})
 
